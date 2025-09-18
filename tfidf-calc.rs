@@ -1,0 +1,772 @@
+#!/usr/bin/env rust-script
+//! ```cargo
+//! [dependencies]
+//! ```
+//!
+//! TF-IDF Calculator — Fast, multicore, no external dependencies.
+//! Processes files recursively, tokenizes ASCII text, computes TF-IDF scores,
+//! and outputs tab-separated values (TSV) for downstream analysis.
+//!
+//! SPDX-License-Identifier: MIT OR Apache-2.0
+
+use std::{
+    cmp::min,
+    collections::{HashMap, HashSet},
+    env,
+    fs::{self, File},
+    hash::{BuildHasherDefault, Hasher},
+    io::{self, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+// ----------------------------
+// Configuration
+// ----------------------------
+
+#[derive(Clone)]
+pub struct Settings {
+    pub root_dir: PathBuf,
+    pub exclude_globs: Vec<String>,
+    pub idf_mode: IdfMode,
+    pub scale: u128,
+    pub jobs: usize,
+    pub stopword_file: Option<PathBuf>,
+    pub include_hidden: bool,
+    pub df_base: DocCountBase,
+    pub status_addr: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdfMode {
+    Frac,   // D / df
+    Smooth, // (D+1)/(df+1)
+    Prob,   // (D - df) / df
+    Log,    // ln(D / df)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocCountBase {
+    All,      // Count every file as a document
+    NonEmpty, // Only count files with ≥1 token
+}
+
+impl Settings {
+    fn from_env_and_args() -> Self {
+        let mut cfg = Settings {
+            root_dir: PathBuf::from("."),
+            exclude_globs: Vec::new(),
+            idf_mode: IdfMode::Frac,
+            scale: 100_000,
+            jobs: thread::available_parallelism().map_or(1, |n| n.get()),
+            stopword_file: None,
+            include_hidden: false, // CHANGED: default to false for safety
+            df_base: DocCountBase::All,
+            status_addr: None,
+        };
+
+        let args: Vec<String> = env::args().collect();
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--root" => {
+                    i += 1;
+                    if i < args.len() {
+                        cfg.root_dir = PathBuf::from(&args[i]);
+                    }
+                }
+                "--exclude" => {
+                    i += 1;
+                    if i < args.len() {
+                        cfg.exclude_globs.push(args[i].clone());
+                    }
+                }
+                "--idf" => {
+                    i += 1;
+                    if i < args.len() {
+                        cfg.idf_mode = match args[i].as_str() {
+                            "frac" => IdfMode::Frac,
+                            "smooth" => IdfMode::Smooth,
+                            "prob" => IdfMode::Prob,
+                            "log" => IdfMode::Log,
+                            _ => {
+                                eprintln!("Unknown IDF mode '{}', using 'frac'", args[i]);
+                                IdfMode::Frac
+                            }
+                        };
+                    }
+                }
+                "--scale" => {
+                    i += 1;
+                    if i < args.len() {
+                        if let Ok(num) = args[i].parse::<u128>() {
+                            cfg.scale = num;
+                        } else {
+                            eprintln!("Invalid scale '{}', using 100000", args[i]);
+                        }
+                    }
+                }
+                "--jobs" => {
+                    i += 1;
+                    if i < args.len() {
+                        if args[i] == "auto" {
+                            cfg.jobs = thread::available_parallelism().map_or(1, |n| n.get());
+                        } else if let Ok(n) = args[i].parse::<usize>() {
+                            cfg.jobs = n.max(1);
+                        } else {
+                            eprintln!("Invalid job count '{}', using auto", args[i]);
+                            cfg.jobs = thread::available_parallelism().map_or(1, |n| n.get());
+                        }
+                    }
+                }
+                "--stopwords" | "--stopword-file" => {
+                    i += 1;
+                    if i < args.len() {
+                        cfg.stopword_file = Some(PathBuf::from(&args[i]));
+                    }
+                }
+                "--include-hidden" => cfg.include_hidden = true,
+                "--no-hidden" => cfg.include_hidden = false,
+                "--df-base" => {
+                    i += 1;
+                    if i < args.len() {
+                        cfg.df_base = match args[i].as_str() {
+                            "nonempty" => DocCountBase::NonEmpty,
+                            "all" => DocCountBase::All,
+                            _ => {
+                                eprintln!("Unknown df-base '{}', using 'all'", args[i]);
+                                DocCountBase::All
+                            }
+                        };
+                    }
+                }
+                "--status" => {
+                    i += 1;
+                    if i < args.len() {
+                        cfg.status_addr = Some(args[i].clone());
+                    }
+                }
+                "--help" | "-h" => help_and_exit(),
+                other => {
+                    eprintln!("Unknown flag: {}", other);
+                    help_and_exit();
+                }
+            }
+            i += 1;
+        }
+
+        cfg
+    }
+}
+
+fn help_and_exit() -> ! {
+    eprintln!(
+        r#"TF-IDF Calculator — Fast, multicore, std-only
+
+Usage: tfidf [OPTIONS]
+
+Options:
+  --root DIR               Root directory to scan (default: ".")
+  --exclude GLOB           Exclude files matching glob (repeatable)
+  --idf MODE               IDF mode: frac|smooth|prob|log (default: frac)
+  --scale N                Scale factor for final score (default: 100000)
+  --jobs N|auto            Number of worker threads (default: auto)
+  --stopwords FILE         File with stopwords (one per line)
+  --include-hidden         Include hidden files (default: false)
+  --no-hidden              Skip hidden files (default)
+  --df-base all|nonempty   Base document count: all files or non-empty only (default: all)
+  --status ADDR            Serve status at ADDR (e.g., 127.0.0.1:9999)
+  -h, --help               Show this help
+
+Output Format (TSV):
+  term<TAB>file_path<TAB>term_freq<TAB>doc_length<TAB>doc_freq<TAB>tf<TAB>idf<TAB>score<TAB>formula
+
+Example:
+  ./tfidf.rs --root ./data --idf log --scale 1000000 --jobs 4 > scores.tsv
+"#
+    );
+    std::process::exit(0);
+}
+
+// ----------------------------
+// Fast Hasher
+// ----------------------------
+
+#[derive(Default)]
+struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut s = self.0 ^ 0x9E37_79B9_7F4A_7C15;
+        let mut i = 0;
+        while i + 8 <= bytes.len() {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&bytes[i..i + 8]);
+            let mut v = u64::from_le_bytes(chunk);
+            v ^= v >> 30;
+            v = v.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            v ^= v >> 27;
+            v = v.wrapping_mul(0x94D0_49BB_1331_11EB);
+            s ^= v;
+            s = s.rotate_left(23).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            i += 8;
+        }
+        for &b in &bytes[i..] {
+            let mut v = b as u64;
+            v ^= v >> 30;
+            v = v.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            s ^= v;
+            s = s.rotate_left(27).wrapping_mul(0x94D0_49BB_1331_11EB);
+        }
+        self.0 = s;
+    }
+
+    fn finish(&self) -> u64 {
+        let mut z = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z ^= z >> 31;
+        z = z.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        z ^= z >> 27;
+        z = z.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        z ^= z >> 33;
+        z
+    }
+}
+
+type FastBuild = BuildHasherDefault<FastHasher>;
+
+// ----------------------------
+// Glob Matching
+// ----------------------------
+
+fn matches_glob(glob: &str, text: &str) -> bool {
+    let g = glob.as_bytes();
+    let t = text.as_bytes();
+    let (mut gi, mut ti) = (0, 0);
+    let (mut star_gi, mut star_ti) = (None, 0);
+
+    while ti < t.len() {
+        if gi < g.len() && (g[gi] == b'?' || g[gi] == t[ti]) {
+            gi += 1;
+            ti += 1;
+        } else if gi < g.len() && g[gi] == b'*' {
+            star_gi = Some(gi);
+            gi += 1;
+            star_ti = ti;
+        } else if let Some(s) = star_gi {
+            gi = s + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+
+    while gi < g.len() && g[gi] == b'*' {
+        gi += 1;
+    }
+
+    gi == g.len()
+}
+
+fn should_skip(path: &Path, globs: &[String], include_hidden: bool) -> bool {
+    let s = path.to_string_lossy();
+    if !include_hidden {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with('.') {
+                return true;
+            }
+        }
+    }
+    globs.iter().any(|g| matches_glob(g, &s))
+}
+
+// ----------------------------
+// File Discovery
+// ----------------------------
+
+fn gather_files(cfg: &Settings) -> io::Result<Vec<PathBuf>> {
+    let mut stack = vec![cfg.root_dir.clone()];
+    let mut files = Vec::new();
+
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let ftype = entry.file_type()?;
+
+            if should_skip(&path, &cfg.exclude_globs, cfg.include_hidden) {
+                continue;
+            }
+
+            if ftype.is_dir() {
+                stack.push(path);
+            } else if ftype.is_file() {
+                files.push(path);
+            }
+        }
+    }
+
+    Ok(files)
+}
+
+// ----------------------------
+// Stopwords
+// ----------------------------
+
+fn read_stopwords(path: &Path) -> io::Result<HashSet<String, FastBuild>> {
+    let content = fs::read_to_string(path)?;
+    let mut set = HashSet::with_hasher(FastBuild::default());
+
+    for line in content.lines() {
+        let word = line.trim().to_lowercase();
+        if !word.is_empty() {
+            set.insert(word);
+        }
+    }
+
+    Ok(set)
+}
+
+// ----------------------------
+// Tokenizer
+// ----------------------------
+
+const READ_BUF: usize = 256 * 1024;
+
+#[derive(Debug)]
+struct TokenStats {
+    tokens: u64,
+    bytes: u64,
+}
+
+#[inline(always)]
+fn is_word_byte(b: u8) -> bool {
+    let lower = b | 0x20;
+    (b'a'..=b'z').contains(&lower) || (b'0'..=b'9').contains(&b) || b == b'_'
+}
+
+fn tokenize<R: Read>(
+    reader: &mut R,
+    stop_set: Option<&HashSet<String, FastBuild>>,
+    emit: &mut dyn FnMut(String),
+) -> io::Result<TokenStats> {
+    let mut buffer = vec![0u8; READ_BUF];
+    let mut carry = Vec::new();
+    let mut tokens = 0u64;
+    let mut bytes = 0u64;
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes += read as u64;
+
+        for &b in &buffer[..read] {
+            if is_word_byte(b) {
+                carry.push(b | 0x20); // lowercase ASCII
+            } else if !carry.is_empty() {
+                let word = unsafe { String::from_utf8_unchecked(std::mem::take(&mut carry)) };
+                if stop_set.map_or(true, |s| !s.contains(&word)) {
+                    emit(word);
+                    tokens += 1;
+                }
+            }
+        }
+    }
+
+    if !carry.is_empty() {
+        let word = unsafe { String::from_utf8_unchecked(carry) };
+        if stop_set.map_or(true, |s| !s.contains(&word)) {
+            emit(word);
+            tokens += 1;
+        }
+    }
+
+    Ok(TokenStats { tokens, bytes })
+}
+
+// ----------------------------
+// Document Analysis
+// ----------------------------
+
+#[derive(Debug)]
+struct Document {
+    path: String,
+    term_freq: HashMap<String, u32, FastBuild>,
+    length: u64,
+    bytes: u64,
+}
+
+fn analyse_file(
+    path: &Path,
+    stop_set: Option<&HashSet<String, FastBuild>>,
+) -> io::Result<Document> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(READ_BUF, file);
+    let mut tf = HashMap::with_hasher(FastBuild::default());
+
+    let stats = tokenize(&mut reader, stop_set, &mut |token| {
+        *tf.entry(token).or_insert(0) += 1;
+    })?;
+
+    Ok(Document {
+        path: path.to_string_lossy().into_owned(),
+        term_freq: tf,
+        length: stats.tokens,
+        bytes: stats.bytes,
+    })
+}
+
+// ----------------------------
+// Counters & Status Server
+// ----------------------------
+
+struct Counters {
+    total_files: AtomicUsize,
+    done_files: AtomicUsize,
+    bytes: AtomicU64,
+    tokens: AtomicU64,
+}
+
+impl Counters {
+    fn new(total: usize) -> Self {
+        Self {
+            total_files: AtomicUsize::new(total),
+            done_files: AtomicUsize::new(0),
+            bytes: AtomicU64::new(0),
+            tokens: AtomicU64::new(0),
+        }
+    }
+}
+
+fn serve_status(addr: String, counters: Arc<Counters>, start: Instant) -> io::Result<()> {
+    let listener = TcpListener::bind(&addr)?;
+    eprintln!("Status server listening at http://{}", addr);
+    listener.set_nonblocking(true)?;
+
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = write_status(&mut stream, &counters, start);
+                let _ = stream.flush();
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                eprintln!("Status server error: {}", e);
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+fn write_status(stream: &mut TcpStream, c: &Counters, start: Instant) -> io::Result<()> {
+    let total = c.total_files.load(Ordering::Relaxed) as u64;
+    let done = c.done_files.load(Ordering::Relaxed) as u64;
+    let remaining = total.saturating_sub(done);
+    let bytes = c.bytes.load(Ordering::Relaxed);
+    let tokens = c.tokens.load(Ordering::Relaxed);
+    let elapsed = start.elapsed().as_secs_f64();
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    let mbps = if elapsed > 0.0 { mb / elapsed } else { 0.0 };
+    let tps = if elapsed > 0.0 { tokens as f64 / elapsed } else { 0.0 };
+
+    writeln!(
+        stream,
+        "files_total: {}\n\
+         files_done: {}\n\
+         files_remaining: {}\n\
+         bytes: {}\n\
+         MB: {:.3}\n\
+         tokens: {}\n\
+         elapsed_s: {:.3}\n\
+         MBps: {:.3}\n\
+         Tok/s: {:.0}\n",
+        total, done, remaining, bytes, mb, tokens, elapsed, mbps, tps
+    )?;
+
+    Ok(())
+}
+
+// ----------------------------
+// Worker Threads
+// ----------------------------
+
+fn spawn_workers(
+    jobs: usize,
+    file_paths: Arc<Vec<PathBuf>>,
+    stopwords: Option<Arc<HashSet<String, FastBuild>>>,
+    counters: Arc<Counters>,
+) -> Vec<Document> {
+    let (doc_tx, doc_rx): (Sender<Document>, Receiver<Document>) = mpsc::channel();
+    let idx = Arc::new(AtomicUsize::new(0));
+    let workers = min(jobs, file_paths.len().max(1));
+
+    for _ in 0..workers {
+        let file_paths = Arc::clone(&file_paths);
+        let stop = stopwords.clone();
+        let doc_tx = doc_tx.clone();
+        let idx = Arc::clone(&idx);
+        let counters = Arc::clone(&counters);
+
+        thread::spawn(move || {
+            loop {
+                let i = idx.fetch_add(1, Ordering::Relaxed);
+                if i >= file_paths.len() {
+                    break;
+                }
+                let path = &file_paths[i];
+                match analyse_file(path, stop.as_deref()) {
+                    Ok(doc) => {
+                        counters.bytes.fetch_add(doc.bytes, Ordering::Relaxed);
+                        counters.tokens.fetch_add(doc.length, Ordering::Relaxed);
+                        let _ = doc_tx.send(doc);
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading {}: {}", path.display(), e);
+                    }
+                }
+                counters.done_files.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    drop(doc_tx);
+
+    doc_rx.into_iter().collect()
+}
+
+// ----------------------------
+// Scoring
+// ----------------------------
+
+#[derive(Clone)]
+struct IdfInfo {
+    display: String,
+    scaled: u128,
+}
+
+fn idf_scaled(mode: IdfMode, df: u64, doc_total: u64, idf_scale: u128) -> IdfInfo {
+    match mode {
+        IdfMode::Frac => {
+            let d = doc_total.max(1) as u128;
+            let f = df.max(1) as u128;
+            let scaled = (d * idf_scale) / f;
+            IdfInfo {
+                display: format!("{}/{}", doc_total, df.max(1)),
+                scaled,
+            }
+        }
+        IdfMode::Smooth => {
+            let d = (doc_total + 1) as u128;
+            let f = (df + 1) as u128;
+            let scaled = (d * idf_scale) / f;
+            IdfInfo {
+                display: format!("{}/{}", doc_total + 1, df + 1),
+                scaled,
+            }
+        }
+        IdfMode::Prob => {
+            let num = doc_total.saturating_sub(df).max(1) as u128;
+            let den = df.max(1) as u128;
+            let scaled = (num * idf_scale) / den;
+            IdfInfo {
+                display: format!("{}/{}", doc_total.saturating_sub(df), df.max(1)),
+                scaled,
+            }
+        }
+        IdfMode::Log => {
+            let d = doc_total.max(1) as f64;
+            let f = df.max(1) as f64;
+            let val = (d / f).ln().max(0.0);
+            let scaled = (val * (idf_scale as f64)).floor() as u128;
+            IdfInfo {
+                display: format!("ln({}/{})", doc_total, df.max(1)),
+                scaled,
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn compute_score(count: u64, idf_scaled: u128, length: u64, tf_scale: u128) -> u128 {
+    let numerator = (count as u128).saturating_mul(idf_scaled).saturating_mul(tf_scale);
+    let denominator = length.max(1) as u128;
+    numerator / denominator
+}
+
+// ----------------------------
+// Main
+// ----------------------------
+
+fn main() -> io::Result<()> {
+    let cfg = Settings::from_env_and_args();
+    let start = Instant::now();
+
+    eprintln!("🔍 Scanning directory: {}", cfg.root_dir.display());
+
+    let all_files = gather_files(&cfg)?;
+    if all_files.is_empty() {
+        eprintln!("No documents found.");
+        return Ok(());
+    }
+
+    eprintln!("📁 Found {} files", all_files.len());
+
+    let stopwords = if let Some(ref p) = cfg.stopword_file {
+        match read_stopwords(p) {
+            Ok(set) => {
+                eprintln!("📖 Loaded {} stopwords", set.len());
+                Some(Arc::new(set))
+            }
+            Err(e) => {
+                eprintln!("⚠️  Failed to load stopwords: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let files = Arc::new(all_files);
+    let counters = Arc::new(Counters::new(files.len()));
+
+    if let Some(addr) = cfg.status_addr.clone() {
+        let counters_clone = Arc::clone(&counters);
+        let start_copy = start;
+        thread::spawn(move || {
+            let _ = serve_status(addr, counters_clone, start_copy);
+        });
+    }
+
+    eprintln!("🧵 Spawning {} worker threads...", cfg.jobs);
+    let analysed = spawn_workers(cfg.jobs, Arc::clone(&files), stopwords, Arc::clone(&counters));
+
+    let docs_in_d = match cfg.df_base {
+        DocCountBase::All => analysed.len() as u64,
+        DocCountBase::NonEmpty => analysed.iter().filter(|d| d.length > 0).count() as u64,
+    };
+
+    eprintln!("📊 Computing document frequencies...");
+
+    let mut document_freq: HashMap<&str, u64, FastBuild> =
+        HashMap::with_hasher(FastBuild::default());
+
+    for doc in &analysed {
+        if matches!(cfg.df_base, DocCountBase::NonEmpty) && doc.length == 0 {
+            continue;
+        }
+        for term in doc.term_freq.keys() {
+            *document_freq.entry(term.as_str()).or_insert(0) += 1;
+        }
+    }
+
+    let idf_scale: u128 = 1_000_000;
+    let mut idf_cache: HashMap<u64, IdfInfo, FastBuild> = HashMap::with_hasher(FastBuild::default());
+
+    eprintln!("💾 Writing TSV output to stdout...");
+
+    let mut stdout = io::BufWriter::with_capacity(256 * 1024, io::stdout());
+
+    writeln!(
+        stdout,
+        "term\tfile_path\tterm_freq\tdoc_length\tdoc_freq\ttf\tidf\tscore\tformula"
+    )?;
+
+    for doc in &analysed {
+        if doc.term_freq.is_empty() {
+            continue;
+        }
+        for (term, &count) in &doc.term_freq {
+            let df = *document_freq.get(term.as_str()).unwrap_or(&0);
+
+            let idf_info = if cfg.idf_mode == IdfMode::Log {
+                idf_scaled(cfg.idf_mode, df, docs_in_d, idf_scale)
+            } else {
+                idf_cache
+                    .entry(df)
+                    .or_insert_with(|| idf_scaled(cfg.idf_mode, df, docs_in_d, idf_scale))
+                    .clone()
+            };
+
+            let score = compute_score(count as u64, idf_info.scaled, doc.length, cfg.scale);
+
+            let tf_sym = format!("{}/{}", count, doc.length);
+            let formula = match cfg.idf_mode {
+                IdfMode::Log => format!(
+                    "({}*ln({}/{:.0})*{})/{}",
+                    count,
+                    docs_in_d,
+                    df.max(1),
+                    cfg.scale,
+                    doc.length
+                ),
+                IdfMode::Frac => {
+                    format!("({}*({}/{:.0})*{})/{}", count, docs_in_d, df.max(1), cfg.scale, doc.length)
+                }
+                IdfMode::Smooth => {
+                    format!(
+                        "({}*({}/{:.0})*{})/{}",
+                        count,
+                        docs_in_d + 1,
+                        df + 1,
+                        cfg.scale,
+                        doc.length
+                    )
+                }
+                IdfMode::Prob => {
+                    format!(
+                        "({}*({}/{:.0})*{})/{}",
+                        count,
+                        docs_in_d.saturating_sub(df),
+                        df.max(1),
+                        cfg.scale,
+                        doc.length
+                    )
+                }
+            };
+
+            writeln!(
+                stdout,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                term,
+                doc.path,
+                count,
+                doc.length,
+                df,
+                tf_sym,
+                idf_info.display,
+                score,
+                formula
+            )?;
+        }
+    }
+
+    stdout.flush()?;
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let total_tokens = counters.tokens.load(Ordering::Relaxed);
+    let total_bytes = counters.bytes.load(Ordering::Relaxed);
+    let mi_bytes = total_bytes as f64 / (1024.0 * 1024.0);
+    let mi_bps = if elapsed > 0.0 { mi_bytes / elapsed } else { 0.0 };
+
+    eprintln!(
+        "✅ Done. Docs: {} | Tokens: {} | MiB: {:.2} | Elapsed: {:.3}s | MiB/s: {:.2}",
+        analysed.len(),
+        total_tokens,
+        mi_bytes,
+        elapsed,
+        mi_bps
+    );
+
+    Ok(())
+}
