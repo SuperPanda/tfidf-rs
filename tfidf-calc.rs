@@ -42,6 +42,8 @@ pub struct Settings {
     pub include_hidden: bool,
     pub df_base: DocCountBase,
     pub status_addr: Option<String>,
+    pub depth: Depth,      // NEW: Control pipeline depth
+    pub stream: bool,      // NEW: Enable streaming/fzf-friendly output
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +60,14 @@ pub enum DocCountBase {
     NonEmpty, // Only count files with ≥1 token
 }
 
+// NEW: Pipeline depth control
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Depth {
+    Full,       // Default: Run full TF-IDF
+    Files,      // Stop after file discovery
+    Tokenized,  // Stop after tokenization (per-file term freq)
+}
+
 impl Settings {
     fn from_env_and_args() -> Self {
         let mut cfg = Settings {
@@ -70,6 +80,8 @@ impl Settings {
             include_hidden: false, // CHANGED: default to false for safety
             df_base: DocCountBase::All,
             status_addr: None,
+            depth: Depth::Full, // DEFAULT
+            stream: false,      // DEFAULT
         };
 
         let args: Vec<String> = env::args().collect();
@@ -153,6 +165,24 @@ impl Settings {
                         cfg.status_addr = Some(args[i].clone());
                     }
                 }
+                // NEW FLAGS
+                "--depth" => {
+                    i += 1;
+                    if i < args.len() {
+                        cfg.depth = match args[i].as_str() {
+                            "files" => Depth::Files,
+                            "tokenized" => Depth::Tokenized,
+                            "full" => Depth::Full,
+                            _ => {
+                                eprintln!("Unknown depth '{}', using 'full'", args[i]);
+                                Depth::Full
+                            }
+                        };
+                    }
+                }
+                "--stream" => {
+                    cfg.stream = true;
+                }
                 "--help" | "-h" => help_and_exit(),
                 other => {
                     eprintln!("Unknown flag: {}", other);
@@ -183,6 +213,8 @@ Options:
   --no-hidden              Skip hidden files (default)
   --df-base all|nonempty   Base document count: all files or non-empty only (default: all)
   --status ADDR            Serve status at ADDR (e.g., 127.0.0.1:9999)
+  --depth full|files|tokenized Control pipeline depth (default: full)
+  --stream                 Enable streaming output (for fzf, etc.)
   -h, --help               Show this help
 
 Output Format (TSV):
@@ -190,6 +222,7 @@ Output Format (TSV):
 
 Example:
   ./tfidf.rs --root ./data --idf log --scale 1000000 --jobs 4 > scores.tsv
+  ./tfidf.rs --depth=tokenized --stream | fzf # Explore terms live
 "#
     );
     std::process::exit(0);
@@ -426,6 +459,116 @@ fn analyse_file(
 }
 
 // ----------------------------
+// Emitter Trait (NEW)
+// ----------------------------
+
+// This trait abstracts how and when data is output.
+// The default implementation (BufferedTsvEmitter) ensures zero performance regression.
+pub trait Emitter: Send {
+    fn emit_header(&mut self) -> io::Result<()>;
+    fn emit_record(&mut self, record: &TfidfRecord) -> io::Result<()>;
+    fn emit_file(&mut self, path: &str) -> io::Result<()>;
+    fn emit_tokenized_doc(&mut self, doc: &Document) -> io::Result<()>;
+    fn flush(&mut self) -> io::Result<()>;
+}
+
+// The original, buffered TSV output. Used by default.
+pub struct BufferedTsvEmitter {
+    writer: io::BufWriter<io::Stdout>,
+    header_written: bool,
+}
+
+impl BufferedTsvEmitter {
+    pub fn new() -> Self {
+        Self {
+            writer: io::BufWriter::with_capacity(256 * 1024, io::stdout()),
+            header_written: false,
+        }
+    }
+}
+
+impl Emitter for BufferedTsvEmitter {
+    fn emit_header(&mut self) -> io::Result<()> {
+        if !self.header_written {
+            writeln!(self.writer, "term\tfile_path\tterm_freq\tdoc_length\tdoc_freq\ttf\tidf\tscore\tformula")?;
+            self.header_written = true;
+        }
+        Ok(())
+    }
+
+    fn emit_record(&mut self, record: &TfidfRecord) -> io::Result<()> {
+        writeln!(
+            self.writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            record.term, record.file_path, record.term_freq, record.doc_length,
+            record.doc_freq, record.tf, record.idf, record.score, record.formula
+        )
+    }
+
+    // For --depth=files or --depth=tokenized, these are NO-OP in buffered mode.
+    // This is key to preserving performance in the default case.
+    fn emit_file(&mut self, _path: &str) -> io::Result<()> { Ok(()) }
+    fn emit_tokenized_doc(&mut self, _doc: &Document) -> io::Result<()> { Ok(()) }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+// A simple, line-oriented emitter for fzf or other streaming consumers.
+pub struct StreamingEmitter {
+    writer: io::Stdout,
+}
+
+impl StreamingEmitter {
+    pub fn new() -> Self {
+        Self {
+            writer: io::stdout(),
+        }
+    }
+}
+
+impl Emitter for StreamingEmitter {
+    fn emit_header(&mut self) -> io::Result<()> { Ok(()) } // No header for streaming
+
+    fn emit_record(&mut self, record: &TfidfRecord) -> io::Result<()> {
+        // Simple format: term<TAB>score<TAB>file_path
+        writeln!(self.writer, "{}\t{}\t{}", record.term, record.score, record.file_path)
+    }
+
+    fn emit_file(&mut self, path: &str) -> io::Result<()> {
+        writeln!(self.writer, "FILE: {}", path)
+    }
+
+    fn emit_tokenized_doc(&mut self, doc: &Document) -> io::Result<()> {
+        for (term, &count) in &doc.term_freq {
+            // Format: term<TAB>count<TAB>file_path
+            writeln!(self.writer, "{}\t{}\t{}", term, count, doc.path)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+// ----------------------------
+// TF-IDF Record (for final output)
+// ----------------------------
+
+#[derive(Debug)]
+struct TfidfRecord {
+    term: String,
+    file_path: String,
+    term_freq: u32,
+    doc_length: u64,
+    doc_freq: u64,
+    tf: String,
+    idf: String,
+    score: u128,
+    formula: String,
+}
+
+// ----------------------------
 // Counters & Status Server
 // ----------------------------
 
@@ -482,15 +625,24 @@ fn write_status(stream: &mut TcpStream, c: &Counters, start: Instant) -> io::Res
 
     writeln!(
         stream,
-        "files_total: {}\n\
-         files_done: {}\n\
-         files_remaining: {}\n\
-         bytes: {}\n\
-         MB: {:.3}\n\
-         tokens: {}\n\
-         elapsed_s: {:.3}\n\
-         MBps: {:.3}\n\
-         Tok/s: {:.0}\n",
+        "files_total: {}
+\
+         files_done: {}
+\
+         files_remaining: {}
+\
+         bytes: {}
+\
+         MB: {:.3}
+\
+         tokens: {}
+\
+         elapsed_s: {:.3}
+\
+         MBps: {:.3}
+\
+         Tok/s: {:.0}
+",
         total, done, remaining, bytes, mb, tokens, elapsed, mbps, tps
     )?;
 
@@ -620,7 +772,23 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    // NEW: Create the appropriate emitter based on flags.
+    let mut emitter: Box<dyn Emitter> = if cfg.stream {
+        Box::new(StreamingEmitter::new())
+    } else {
+        Box::new(BufferedTsvEmitter::new())
+    };
+
     eprintln!("📁 Found {} files", all_files.len());
+
+    // NEW: Handle --depth=files
+    if cfg.depth == Depth::Files {
+        for path in &all_files {
+            emitter.emit_file(&path.to_string_lossy())?;
+        }
+        emitter.flush()?;
+        return Ok(());
+    }
 
     let stopwords = if let Some(ref p) = cfg.stopword_file {
         match read_stopwords(p) {
@@ -651,6 +819,17 @@ fn main() -> io::Result<()> {
     eprintln!("🧵 Spawning {} worker threads...", cfg.jobs);
     let analysed = spawn_workers(cfg.jobs, Arc::clone(&files), stopwords, Arc::clone(&counters));
 
+    // NEW: Handle --depth=tokenized
+    if cfg.depth == Depth::Tokenized {
+        for doc in &analysed {
+            emitter.emit_tokenized_doc(doc)?;
+        }
+        emitter.flush()?;
+        return Ok(());
+    }
+
+    // If we reach here, depth is Full. Proceed with original logic.
+
     let docs_in_d = match cfg.df_base {
         DocCountBase::All => analysed.len() as u64,
         DocCountBase::NonEmpty => analysed.iter().filter(|d| d.length > 0).count() as u64,
@@ -674,13 +853,7 @@ fn main() -> io::Result<()> {
     let mut idf_cache: HashMap<u64, IdfInfo, FastBuild> = HashMap::with_hasher(FastBuild::default());
 
     eprintln!("💾 Writing TSV output to stdout...");
-
-    let mut stdout = io::BufWriter::with_capacity(256 * 1024, io::stdout());
-
-    writeln!(
-        stdout,
-        "term\tfile_path\tterm_freq\tdoc_length\tdoc_freq\ttf\tidf\tscore\tformula"
-    )?;
+    emitter.emit_header()?;
 
     for doc in &analysed {
         if doc.term_freq.is_empty() {
@@ -735,23 +908,23 @@ fn main() -> io::Result<()> {
                 }
             };
 
-            writeln!(
-                stdout,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                term,
-                doc.path,
-                count,
-                doc.length,
-                df,
-                tf_sym,
-                idf_info.display,
+            let record = TfidfRecord {
+                term: term.clone(),
+                file_path: doc.path.clone(),
+                term_freq: count,
+                doc_length: doc.length,
+                doc_freq: df,
+                tf: tf_sym,
+                idf: idf_info.display,
                 score,
-                formula
-            )?;
+                formula,
+            };
+
+            emitter.emit_record(&record)?;
         }
     }
 
-    stdout.flush()?;
+    emitter.flush()?;
 
     let elapsed = start.elapsed().as_secs_f64();
     let total_tokens = counters.tokens.load(Ordering::Relaxed);
