@@ -1,4 +1,4 @@
-#!/usr/bin/env rust-script
+#!/usr/bin/env -S rust-script
 //! ```cargo
 //! [dependencies]
 //! ```
@@ -7,7 +7,6 @@
 //! Processes files recursively, tokenizes ASCII text, computes TF-IDF scores,
 //! and outputs tab-separated values (TSV) for downstream analysis.
 //!
-//! SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::{
     cmp::min,

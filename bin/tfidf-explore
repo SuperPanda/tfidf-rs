@@ -1,4 +1,5 @@
-#!/usr/bin/env rust-script
+#!/usr/bin/env -S rust-script
+//!
 //! ```cargo
 //! [dependencies]
 //! csv = "1.3"
