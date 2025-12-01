@@ -1,0 +1,3 @@
+#!/usr/bin/env sh
+
+./tfidf.rs 2>&1 | xargs -0 terminal-ai --model="gpt-5" --input-file="tfidf.rs" -- "provide correction only"
