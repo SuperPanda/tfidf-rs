@@ -603,10 +603,12 @@ fn cmd_query(args: &[String]) -> Result<()> {
             let top_n = parse_flag_value(&args[2..], "--top").unwrap_or(20);
             let terms = index.top_terms(top_n);
 
-            println!("\n📊 Top {} Terms\n", top_n);
-            println!("{:<30} | {:>12}", "Term", "Score");
-            println!("{}", "-".repeat(50));
 
+            if !is_silent() {
+                println!("\n📊 Top {} Terms\n", top_n);
+                println!("{:<30} | {:>12}", "Term", "Score");
+                println!("{}", "-".repeat(50));
+            }
             for (term, score) in terms {
                 println!("{:<30} | {:>12.4}", term, score);
             }
