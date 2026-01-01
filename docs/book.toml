@@ -1,0 +1,18 @@
+[book]
+authors = ["Andrew Briscoe"]
+language = "en"
+src = "src"
+title = "tfidf-rs :: Reference Docs"
+
+[preprocessor.d2]
+layout = "elk"
+inline = true
+
+
+[output.html]
+no-section-labels = false
+
+[output.html.print]
+enable = true
+page-break = true
+

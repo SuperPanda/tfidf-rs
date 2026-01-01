@@ -1,1 +1,4 @@
 target/**
+.generated
+GIT-COMMIT-MSG
+tree
