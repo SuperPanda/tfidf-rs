@@ -5,5 +5,5 @@ vlist ctx:tfidf:todo export
 echo
 echo "codeforge"
 echo "---------"
-codeforge issues tfidf-rs
+codeforge issues tfidf-rs --json
 

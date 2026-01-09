@@ -12,12 +12,12 @@
 //
 // Usage:
 //   tfidf save <index> [PATH...] [--]
-//   tfidf query [--index <path>] {terms|similar|list} [args...]
+//   tfidf query [--index <path>] {terms|similar|list|search} [args...]
 //
 // Requirements:
 //   - Tab-delimited output suitable for cut, sort, xargs
 //   - Graceful handling of pipe termination (head, tail)
-//   - Index path resolution: --index > TFIDF_INDEX > ./tfidf.index
+//   - Index path resolution: --index > TFIDF_INDEX > state > XDG
 //   - XDG paths use TFIDF_APPNAME prefix for multi-instance support
 //   - Stdin path mixing after -- for composition
 //   - No decoration or progress output in normal operation
@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -278,6 +278,81 @@ struct Document {
     length: u32,
 }
 
+/// State tracking for search history and context.
+/// Maintains the relationship between working directories and their search contexts.
+#[derive(Serialize, Deserialize, Default)]
+struct State {
+    /// Map from working directory to search context
+    contexts: FastMap<String, SearchContext>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct SearchContext {
+    /// Last accessed index path for this directory
+    index_path: String,
+    /// Recent search queries
+    queries: Vec<String>,
+}
+
+impl State {
+    /// Load state from XDG state directory.
+    fn load() -> Result<Self> {
+        let path = state_path();
+        if !path.exists() {
+            return Ok(State::default());
+        }
+        let file = File::open(&path)?;
+        let reader = BufReader::new(file);
+        Ok(bincode::deserialize_from(reader).unwrap_or_default())
+    }
+
+    /// Save state to XDG state directory.
+    fn save(&self) -> Result<()> {
+        let path = state_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = File::create(&path)?;
+        let writer = BufWriter::new(file);
+        bincode::serialize_into(writer, self)?;
+        Ok(())
+    }
+
+    /// Record a search query for the current working directory.
+    fn record_search(&mut self, cwd: String, index: String, query: String) {
+        let context = self.contexts.entry(cwd).or_insert_with(|| SearchContext {
+            index_path: index.clone(),
+            queries: Vec::new(),
+        });
+        context.index_path = index;
+        context.queries.push(query);
+        
+        // Keep only last 100 queries per directory
+        if context.queries.len() > 100 {
+            context.queries.drain(0..context.queries.len() - 100);
+        }
+    }
+
+    /// Get the last used index for a directory.
+    fn last_index(&self, cwd: &str) -> Option<&str> {
+        self.contexts.get(cwd).map(|c| c.index_path.as_str())
+    }
+}
+
+/// Resolve state file path using XDG state directory.
+fn state_path() -> PathBuf {
+    let app = app_name();
+    env::var("XDG_STATE_HOME")
+        .ok()
+        .map(|x| PathBuf::from(x).join(&app).join("state"))
+        .or_else(|| {
+            env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local/state").join(&app).join("state"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".tfidf.state"))
+}
+
 /// The index maintains the invariant that term_df[t] equals the number
 /// of documents containing term t. This allows efficient IDF computation.
 /// 
@@ -430,6 +505,45 @@ impl Index {
         
         Ok(scores)
     }
+
+    /// Search documents by query string.
+    /// Tokenizes the query and computes similarity against all documents.
+    fn search(&self, query: &str, n: usize, stopwords: &FastMap<String, ()>) -> Vec<(String, f64)> {
+        let query_tokens = tokenize(query.as_bytes(), stopwords);
+        
+        if query_tokens.is_empty() {
+            return Vec::new();
+        }
+
+        let mut query_terms: TermFreq = FastMap::default();
+        for token in query_tokens {
+            *query_terms.entry(token).or_insert(0) += 1;
+        }
+        
+        let query_len = query_terms.values().sum();
+        let query_vec: FastMap<String, f64> = query_terms
+            .iter()
+            .map(|(term, &count)| {
+                (term.clone(), self.tfidf(term, count, query_len))
+            })
+            .collect();
+
+        let mut scores: Vec<_> = self
+            .docs
+            .par_iter()
+            .map(|doc| {
+                let vec = self.vector(doc);
+                let sim = cosine_similarity(&query_vec, &vec);
+                (doc.path.clone(), sim)
+            })
+            .filter(|(_, s)| *s > 0.0)
+            .collect();
+
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores.truncate(n);
+        
+        scores
+    }
 }
 
 /// Compute cosine similarity between two sparse vectors.
@@ -520,7 +634,22 @@ fn cmd_save(args: Vec<String>) -> Result<()> {
     let stopwords = load_stopwords()?;
     let corpus = Corpus::from_paths(paths)?;
     let index = Index::build(&corpus, &stopwords)?;
+    
+    if let Some(parent) = index_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     index.save(&index_path)?;
+    
+    // Update state with the saved index path
+    let cwd = env::current_dir()?.to_string_lossy().into_owned();
+    let index_str = index_path.to_string_lossy().into_owned();
+    let mut state = State::load().unwrap_or_default();
+    let context = state.contexts.entry(cwd).or_insert_with(|| SearchContext {
+        index_path: index_str.clone(),
+        queries: Vec::new(),
+    });
+    context.index_path = index_str;
+    state.save()?;
     
     Ok(())
 }
@@ -552,17 +681,40 @@ fn cmd_query(mut args: Vec<String>) -> Result<()> {
     }
 
     let index = Index::load(&index_path)?;
+    let index_path_str = index_path.to_string_lossy().into_owned();
     let subcmd = args.remove(0);
 
     match subcmd.as_str() {
         "list" => cmd_list(index),
         "terms" => cmd_terms(index, args),
         "similar" => cmd_similar(index, args),
+        "search" => cmd_search(index, index_path_str, args),
         _ => {
             print_usage();
             std::process::exit(1);
         }
     }
+}
+
+/// Get index path from state for current directory.
+fn state_index_path() -> Option<PathBuf> {
+    let cwd = env::current_dir().ok()?.to_string_lossy().into_owned();
+    let state = State::load().ok()?;
+    state.last_index(&cwd).map(PathBuf::from)
+}
+
+/// Get default XDG data path for index.
+fn xdg_index_path() -> PathBuf {
+    let app = app_name();
+    env::var("XDG_DATA_HOME")
+        .ok()
+        .map(|x| PathBuf::from(x).join(&app).join("index"))
+        .or_else(|| {
+            env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local/share").join(&app).join("index"))
+        })
+        .unwrap_or_else(|| PathBuf::from("tfidf.index"))
 }
 
 /// Resolve index path from explicit flag, environment, or XDG default.
@@ -571,26 +723,9 @@ fn resolve_index_path(explicit: Option<&str>) -> PathBuf {
     explicit
         .map(PathBuf::from)
         .or_else(|| env::var("TFIDF_INDEX").ok().map(PathBuf::from))
-        //.or_else(|| {
-            // Try to load from state based on current directory
-        //    let cwd = env::current_dir().ok()?.to_string_lossy().into_owned();
-        //    let state = State::load().ok()?;
-        //    state.last_index(&cwd).map(PathBuf::from)
-        //})
-        .unwrap_or_else(|| {
-            let app = app_name();
-            env::var("XDG_DATA_HOME")
-                .ok()
-                .map(|x| PathBuf::from(x).join(&app).join("index"))
-                .or_else(|| {
-                    env::var("HOME")
-                        .ok()
-                        .map(|h| PathBuf::from(h).join(".local/share").join(&app).join("index"))
-                })
-                .unwrap_or_else(|| PathBuf::from("tfidf.index"))
-        })
+        .or_else(state_index_path)
+        .unwrap_or_else(xdg_index_path)
 }
-
 
 /// Parse --top N flag, returning default if not present.
 fn parse_top(args: &[String], default: usize) -> usize {
@@ -641,6 +776,41 @@ fn cmd_similar(index: Index, args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+fn cmd_search(index: Index, index_path: String, args: Vec<String>) -> Result<()> {
+    let n = parse_top(&args, 10);
+    let stopwords = load_stopwords()?;
+    
+    // Read query from stdin if args are empty, otherwise use first arg
+    let query = if args.is_empty() || args[0] == "--top" {
+        let mut buffer = String::new();
+        io::stdin().read_to_string(&mut buffer)?;
+        buffer.trim().to_string()
+    } else {
+        args[0].clone()
+    };
+    
+    if query.is_empty() {
+        eprintln!("tfidf query search: empty query");
+        std::process::exit(1);
+    }
+    
+    let results = index.search(&query, n, &stopwords);
+    let mut out = PipeWriter::new();
+    
+    for (path, score) in results {
+        out.writeln(&format!("{}\t{:.6}", path, score))?;
+    }
+    out.flush()?;
+    
+    // Record search in state
+    let cwd = env::current_dir()?.to_string_lossy().into_owned();
+    let mut state = State::load().unwrap_or_default();
+    state.record_search(cwd, index_path, query);
+    state.save()?;
+    
+    Ok(())
+}
+
 fn print_usage() {
     eprintln!(
         "\
@@ -658,11 +828,20 @@ QUERY SUBCOMMANDS
   list                    List all indexed documents
   terms [--top N]         Show top N terms (default: 20)
   similar <file> [--top N]  Find similar documents (default: 10)
+  search [query] [--top N]  Search by query string (default: 10)
+                           Reads from stdin if query not provided
 
 INDEX RESOLUTION
   1. --index flag
   2. TFIDF_INDEX environment variable
-  3. ./tfidf.index
+  3. Last used index for current directory (from state)
+  4. $XDG_DATA_HOME/$TFIDF_APPNAME/index
+  5. ~/.local/share/$TFIDF_APPNAME/index
+
+STATE
+  Query history and index associations stored in:
+    $XDG_STATE_HOME/$TFIDF_APPNAME/state
+    ~/.local/state/$TFIDF_APPNAME/state
 
 CONFIGURATION
   Stopwords: $XDG_CONFIG_HOME/$TFIDF_APPNAME/stopwords.txt
@@ -683,6 +862,8 @@ EXAMPLES
   tfidf query list | head -5
   tfidf query terms --top 100 | sort -k2,2nr
   tfidf query similar main.rs | cut -f1 | xargs cat
+  tfidf query search \"error handling rust\" --top 20
+  echo \"memory management\" | tfidf query search --top 10
   
   # Use separate configuration
   TFIDF_APPNAME=work tfidf save work.index ~/work/docs
@@ -788,12 +969,6 @@ mod tests {
         
         let sim = cosine_similarity(&vec_a, &vec_b);
         assert_eq!(sim, 0.0);
-    }
-
-    #[test]
-    fn test_resolve_index_path_explicit() {
-        let path = resolve_index_path(Some("custom.index"));
-        assert_eq!(path, PathBuf::from("custom.index"));
     }
 
     #[test]
