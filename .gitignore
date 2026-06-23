@@ -1,4 +1,5 @@
 target/**
+.stash
 .generated
 GIT-COMMIT-MSG
 tree

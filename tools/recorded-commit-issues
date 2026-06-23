@@ -1,0 +1,1 @@
+tools/commit-message-history | sed -n '/\*\*Issues.*/,/^[^ ]/{/\*\*/d;/^comm/d;/^[ ]*$/d; p}'
