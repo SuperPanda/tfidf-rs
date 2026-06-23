@@ -1,26 +1,16 @@
-#!/usr/bin/env -S rust-script
-//! ```cargo
-//! [dependencies]
-//! rayon = "1.8"
-//! bincode = "1.3"
-//! serde = { version = "1.0", features = ["derive"] }
-//! ```
-//!
-// src/bin/tfidf.rs
-//
 // A composable TF-IDF index for pipe-friendly text analysis.
 //
 // Usage:
-//   tfidf save <index> [PATH...] [--]
+//   tfidf save [--index <path>] [PATH...] [--]
 //   tfidf query [--index <path>] {terms|similar|list|search} [args...]
 //
 // Requirements:
 //   - Tab-delimited output suitable for cut, sort, xargs
 //   - Graceful handling of pipe termination (head, tail)
-//   - Index path resolution: --index > TFIDF_INDEX > state > XDG
+//   - Index path resolution: --index > TFIDF_INDEX > data dir
 //   - XDG paths use TFIDF_APPNAME prefix for multi-instance support
 //   - Stdin path mixing after -- for composition
-//   - No decoration or progress output in normal operation
+//   - No decoration, progress output, or hidden state writes in normal operation
 //
 // Design:
 //   Functions compose through clear interfaces. The Index forms a monoid
@@ -46,6 +36,9 @@ use std::path::{Path, PathBuf};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+const DEFAULT_APP_NAME: &str = "tfidf";
+const DEFAULT_INDEX_FILE: &str = "tfidf.index";
+
 // ============================================================================
 // Fast Hasher
 // ============================================================================
@@ -61,8 +54,7 @@ impl Hasher for FastHasher {
         for chunk in bytes.chunks(8) {
             let v = match chunk.len() {
                 8 => u64::from_le_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3],
-                    chunk[4], chunk[5], chunk[6], chunk[7],
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
                 ]),
                 _ => {
                     let mut v = 0u64;
@@ -147,7 +139,7 @@ fn is_word_byte(b: u8) -> bool {
 }
 
 /// Extract lowercase word tokens from bytes, filtering stopwords.
-/// 
+///
 /// Tokenization forms a functor from byte sequences to term multisets.
 /// The lowercase normalization is an equivalence relation over terms.
 fn tokenize(text: &[u8], stopwords: &FastMap<String, ()>) -> Vec<String> {
@@ -181,25 +173,35 @@ fn tokenize(text: &[u8], stopwords: &FastMap<String, ()>) -> Vec<String> {
 /// Uses TFIDF_APPNAME if set, otherwise defaults to "tfidf".
 /// This allows multiple independent instances with different configurations.
 fn app_name() -> String {
-    env::var("TFIDF_APPNAME").unwrap_or_else(|_| "tfidf".to_string())
+    env::var("TFIDF_APPNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_APP_NAME.to_string())
 }
 
 /// Load stopwords from standard config locations.
 /// Returns empty set if no stopwords file exists.
-/// 
+///
 /// Search order:
 ///   1. $XDG_CONFIG_HOME/${TFIDF_APPNAME}/stopwords.txt
 ///   2. ~/.config/${TFIDF_APPNAME}/stopwords.txt
 fn load_stopwords() -> Result<FastMap<String, ()>> {
     let app = app_name();
-    
+
     let paths = [
         env::var("XDG_CONFIG_HOME")
             .ok()
+            .filter(|value| !value.is_empty())
             .map(|x| PathBuf::from(x).join(&app).join("stopwords.txt")),
         env::var("HOME")
             .ok()
-            .map(|h| PathBuf::from(h).join(".config").join(&app).join("stopwords.txt")),
+            .filter(|value| !value.is_empty())
+            .map(|h| {
+                PathBuf::from(h)
+                    .join(".config")
+                    .join(&app)
+                    .join("stopwords.txt")
+            }),
     ];
 
     for path in paths.into_iter().flatten() {
@@ -218,6 +220,65 @@ fn load_stopwords() -> Result<FastMap<String, ()>> {
     }
 
     Ok(FastMap::default())
+}
+
+// ============================================================================
+// XDG paths
+// ============================================================================
+
+fn cwd_or_dot() -> PathBuf {
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Resolve the TF-IDF data directory.
+///
+/// Precedence:
+///   1. $TFIDF_DATA_DIR
+///   2. $XDG_DATA_HOME/$TFIDF_APPNAME
+///   3. $HOME/.local/share/$TFIDF_APPNAME
+///   4. ./$TFIDF_APPNAME
+///
+/// $TFIDF_APPNAME defaults to "tfidf".
+fn tfidf_data_dir() -> PathBuf {
+    if let Some(path) = env_path("TFIDF_DATA_DIR") {
+        return path;
+    }
+
+    let app = app_name();
+
+    if let Some(path) = env_path("XDG_DATA_HOME") {
+        return path.join(app);
+    }
+
+    home_dir()
+        .map(|home| home.join(".local").join("share").join(&app))
+        .unwrap_or_else(|| cwd_or_dot().join(app))
+}
+
+/// Get default data path for index.
+fn xdg_index_path() -> PathBuf {
+    tfidf_data_dir().join(DEFAULT_INDEX_FILE)
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -278,84 +339,9 @@ struct Document {
     length: u32,
 }
 
-/// State tracking for search history and context.
-/// Maintains the relationship between working directories and their search contexts.
-#[derive(Serialize, Deserialize, Default)]
-struct State {
-    /// Map from working directory to search context
-    contexts: FastMap<String, SearchContext>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct SearchContext {
-    /// Last accessed index path for this directory
-    index_path: String,
-    /// Recent search queries
-    queries: Vec<String>,
-}
-
-impl State {
-    /// Load state from XDG state directory.
-    fn load() -> Result<Self> {
-        let path = state_path();
-        if !path.exists() {
-            return Ok(State::default());
-        }
-        let file = File::open(&path)?;
-        let reader = BufReader::new(file);
-        Ok(bincode::deserialize_from(reader).unwrap_or_default())
-    }
-
-    /// Save state to XDG state directory.
-    fn save(&self) -> Result<()> {
-        let path = state_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let file = File::create(&path)?;
-        let writer = BufWriter::new(file);
-        bincode::serialize_into(writer, self)?;
-        Ok(())
-    }
-
-    /// Record a search query for the current working directory.
-    fn record_search(&mut self, cwd: String, index: String, query: String) {
-        let context = self.contexts.entry(cwd).or_insert_with(|| SearchContext {
-            index_path: index.clone(),
-            queries: Vec::new(),
-        });
-        context.index_path = index;
-        context.queries.push(query);
-        
-        // Keep only last 100 queries per directory
-        if context.queries.len() > 100 {
-            context.queries.drain(0..context.queries.len() - 100);
-        }
-    }
-
-    /// Get the last used index for a directory.
-    fn last_index(&self, cwd: &str) -> Option<&str> {
-        self.contexts.get(cwd).map(|c| c.index_path.as_str())
-    }
-}
-
-/// Resolve state file path using XDG state directory.
-fn state_path() -> PathBuf {
-    let app = app_name();
-    env::var("XDG_STATE_HOME")
-        .ok()
-        .map(|x| PathBuf::from(x).join(&app).join("state"))
-        .or_else(|| {
-            env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local/state").join(&app).join("state"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".tfidf.state"))
-}
-
 /// The index maintains the invariant that term_df[t] equals the number
 /// of documents containing term t. This allows efficient IDF computation.
-/// 
+///
 /// Future extension: This structure naturally extends to a monoid where
 /// the binary operation is index union (with DF recomputation). The identity
 /// is the empty index.
@@ -375,7 +361,7 @@ impl Index {
             .filter_map(|(i, path)| {
                 let bytes = fs::read(path).ok()?;
                 let tokens = tokenize(&bytes, stopwords);
-                
+
                 if tokens.is_empty() {
                     return None;
                 }
@@ -387,7 +373,7 @@ impl Index {
                 }
 
                 let length = terms.values().sum();
-                
+
                 Some(Document {
                     id: i as u32,
                     path: path.to_string_lossy().into_owned(),
@@ -410,6 +396,7 @@ impl Index {
 
     /// Serialize index to disk.
     fn save(&self, path: &Path) -> Result<()> {
+        ensure_parent_dir(path)?;
         let file = File::create(path)?;
         let writer = BufWriter::new(file);
         bincode::serialize_into(writer, self)?;
@@ -424,20 +411,20 @@ impl Index {
     }
 
     /// Compute TF-IDF score for a term in a document.
-    /// 
+    ///
     /// TF-IDF = TF(t,d) × IDF(t)
     /// where:
     ///   TF(t,d) = count(t,d) / |d|
     ///   IDF(t) = ln((D + 1) / (df(t) + 1))
-    /// 
+    ///
     /// The smoothing (+1) prevents division by zero and handles unseen terms.
     fn tfidf(&self, term: &str, count: u32, doc_len: u32) -> f64 {
         let df = self.term_df.get(term).copied().unwrap_or(1) as f64;
         let num_docs = self.docs.len().max(1) as f64;
-        
+
         let idf = ((num_docs + 1.0) / (df + 1.0)).ln().max(0.0);
         let tf = count as f64 / doc_len.max(1) as f64;
-        
+
         tf * idf
     }
 
@@ -446,9 +433,7 @@ impl Index {
     fn vector(&self, doc: &Document) -> FastMap<String, f64> {
         doc.terms
             .iter()
-            .map(|(term, &count)| {
-                (term.clone(), self.tfidf(term, count, doc.length))
-            })
+            .map(|(term, &count)| (term.clone(), self.tfidf(term, count, doc.length)))
             .collect()
     }
 
@@ -460,7 +445,7 @@ impl Index {
     /// Extract top N terms by aggregate TF-IDF score across all documents.
     fn top_terms(&self, n: usize) -> Vec<(String, f64)> {
         let mut scores: FastMap<String, f64> = FastMap::default();
-        
+
         for doc in &self.docs {
             for (term, &count) in &doc.terms {
                 let score = self.tfidf(term, count, doc.length);
@@ -475,7 +460,7 @@ impl Index {
     }
 
     /// Find documents similar to target using cosine similarity.
-    /// 
+    ///
     /// Cosine similarity forms a metric on the vector space of TF-IDF representations.
     /// It's invariant to document length scaling, making it suitable for comparing
     /// documents of different sizes.
@@ -502,7 +487,7 @@ impl Index {
 
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scores.truncate(n);
-        
+
         Ok(scores)
     }
 
@@ -510,7 +495,7 @@ impl Index {
     /// Tokenizes the query and computes similarity against all documents.
     fn search(&self, query: &str, n: usize, stopwords: &FastMap<String, ()>) -> Vec<(String, f64)> {
         let query_tokens = tokenize(query.as_bytes(), stopwords);
-        
+
         if query_tokens.is_empty() {
             return Vec::new();
         }
@@ -519,13 +504,11 @@ impl Index {
         for token in query_tokens {
             *query_terms.entry(token).or_insert(0) += 1;
         }
-        
+
         let query_len = query_terms.values().sum();
         let query_vec: FastMap<String, f64> = query_terms
             .iter()
-            .map(|(term, &count)| {
-                (term.clone(), self.tfidf(term, count, query_len))
-            })
+            .map(|(term, &count)| (term.clone(), self.tfidf(term, count, query_len)))
             .collect();
 
         let mut scores: Vec<_> = self
@@ -541,15 +524,15 @@ impl Index {
 
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scores.truncate(n);
-        
+
         scores
     }
 }
 
 /// Compute cosine similarity between two sparse vectors.
-/// 
+///
 /// cos(a,b) = (a·b) / (||a|| ||b||)
-/// 
+///
 /// This is the canonical inner product on the unit sphere, making it
 /// a proper metric for comparing direction regardless of magnitude.
 fn cosine_similarity(a: &FastMap<String, f64>, b: &FastMap<String, f64>) -> f64 {
@@ -581,7 +564,7 @@ fn cosine_similarity(a: &FastMap<String, f64>, b: &FastMap<String, f64>) -> f64 
 
 fn main() -> Result<()> {
     let mut args: Vec<String> = env::args().skip(1).collect();
-    
+
     if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help") {
         print_usage();
         return Ok(());
@@ -597,23 +580,85 @@ fn main() -> Result<()> {
     }
 }
 
-/// Build and save an index from the given paths.
-/// Paths after -- are read from stdin, one per line.
-fn cmd_save(args: Vec<String>) -> Result<()> {
-    if args.is_empty() {
-        eprintln!("tfidf save <index> [PATH...] [--]");
-        std::process::exit(1);
+fn take_index_flag(args: &mut Vec<String>) -> Option<String> {
+    let mut index_arg = None;
+    let mut i = 0;
+
+    while i < args.len() {
+        if args[i] == "--index" {
+            if i + 1 >= args.len() {
+                eprintln!("--index requires a path");
+                std::process::exit(1);
+            }
+            index_arg = Some(args.remove(i + 1));
+            args.remove(i);
+        } else {
+            i += 1;
+        }
     }
 
-    let index_path = PathBuf::from(&args[0]);
+    index_arg
+}
+
+fn should_treat_first_save_arg_as_legacy_index(first: &str, arg_count: usize) -> bool {
+    if arg_count < 2 {
+        return false;
+    }
+
+    let path = Path::new(first);
+
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "index" || name == DEFAULT_INDEX_FILE)
+    {
+        return true;
+    }
+
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension == "index")
+    {
+        return true;
+    }
+
+    !path.exists()
+}
+
+/// Build and save an index from the given paths.
+/// Paths after -- are read from stdin, one per line.
+///
+/// Supported forms:
+///   tfidf save [--index <path>] [PATH...] [--]
+///   tfidf save <index> [PATH...] [--]      # legacy positional index
+fn cmd_save(mut args: Vec<String>) -> Result<()> {
+    let explicit_index = take_index_flag(&mut args);
+
     let mut paths = Vec::new();
+    let mut positional = Vec::new();
     let mut read_stdin = false;
 
-    for arg in &args[1..] {
+    for arg in args {
         if arg == "--" {
             read_stdin = true;
             break;
         }
+        positional.push(arg);
+    }
+
+    let index_path = if let Some(index) = explicit_index {
+        PathBuf::from(index)
+    } else if positional
+        .first()
+        .is_some_and(|first| should_treat_first_save_arg_as_legacy_index(first, positional.len()))
+    {
+        PathBuf::from(positional.remove(0))
+    } else {
+        resolve_index_path(None)
+    };
+
+    for arg in positional {
         paths.push(PathBuf::from(arg));
     }
 
@@ -628,48 +673,24 @@ fn cmd_save(args: Vec<String>) -> Result<()> {
 
     if paths.is_empty() {
         eprintln!("tfidf save: no input paths");
+        eprintln!("usage: tfidf save [--index <path>] [PATH...] [--]");
         std::process::exit(1);
     }
 
     let stopwords = load_stopwords()?;
     let corpus = Corpus::from_paths(paths)?;
     let index = Index::build(&corpus, &stopwords)?;
-    
-    if let Some(parent) = index_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+
     index.save(&index_path)?;
-    
-    // Update state with the saved index path
-    let cwd = env::current_dir()?.to_string_lossy().into_owned();
-    let index_str = index_path.to_string_lossy().into_owned();
-    let mut state = State::load().unwrap_or_default();
-    let context = state.contexts.entry(cwd).or_insert_with(|| SearchContext {
-        index_path: index_str.clone(),
-        queries: Vec::new(),
-    });
-    context.index_path = index_str;
-    state.save()?;
-    
+
     Ok(())
 }
 
 /// Execute a query against a saved index.
 fn cmd_query(mut args: Vec<String>) -> Result<()> {
-    // Extract --index flag if present
-    let mut index_arg = None;
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--index" && i + 1 < args.len() {
-            index_arg = Some(args.remove(i + 1));
-            args.remove(i);
-        } else {
-            i += 1;
-        }
-    }
-
+    let index_arg = take_index_flag(&mut args);
     let index_path = resolve_index_path(index_arg.as_deref());
-    
+
     if !index_path.exists() {
         eprintln!("index not found: {}", index_path.display());
         std::process::exit(1);
@@ -681,14 +702,13 @@ fn cmd_query(mut args: Vec<String>) -> Result<()> {
     }
 
     let index = Index::load(&index_path)?;
-    let index_path_str = index_path.to_string_lossy().into_owned();
     let subcmd = args.remove(0);
 
     match subcmd.as_str() {
         "list" => cmd_list(index),
         "terms" => cmd_terms(index, args),
         "similar" => cmd_similar(index, args),
-        "search" => cmd_search(index, index_path_str, args),
+        "search" => cmd_search(index, args),
         _ => {
             print_usage();
             std::process::exit(1);
@@ -696,35 +716,22 @@ fn cmd_query(mut args: Vec<String>) -> Result<()> {
     }
 }
 
-/// Get index path from state for current directory.
-fn state_index_path() -> Option<PathBuf> {
-    let cwd = env::current_dir().ok()?.to_string_lossy().into_owned();
-    let state = State::load().ok()?;
-    state.last_index(&cwd).map(PathBuf::from)
-}
-
-/// Get default XDG data path for index.
-fn xdg_index_path() -> PathBuf {
-    let app = app_name();
-    env::var("XDG_DATA_HOME")
-        .ok()
-        .map(|x| PathBuf::from(x).join(&app).join("index"))
-        .or_else(|| {
-            env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local/share").join(&app).join("index"))
-        })
-        .unwrap_or_else(|| PathBuf::from("tfidf.index"))
-}
-
-/// Resolve index path from explicit flag, environment, or XDG default.
-/// This forms a simple cascade with clear precedence.
+/// Resolve index path from explicit flag, environment, or the XDG data default.
+///
+/// Precedence:
+///   1. explicit path
+///   2. TFIDF_INDEX
+///   3. data-dir default path
 fn resolve_index_path(explicit: Option<&str>) -> PathBuf {
-    explicit
-        .map(PathBuf::from)
-        .or_else(|| env::var("TFIDF_INDEX").ok().map(PathBuf::from))
-        .or_else(state_index_path)
-        .unwrap_or_else(xdg_index_path)
+    if let Some(path) = explicit {
+        return PathBuf::from(path);
+    }
+
+    if let Some(path) = env_path("TFIDF_INDEX") {
+        return path;
+    }
+
+    xdg_index_path()
 }
 
 /// Parse --top N flag, returning default if not present.
@@ -748,12 +755,12 @@ fn cmd_terms(index: Index, args: Vec<String>) -> Result<()> {
     let n = parse_top(&args, 20);
     let terms = index.top_terms(n);
     let mut out = PipeWriter::new();
-    
+
     for (term, score) in terms {
         out.writeln(&format!("{}\t{:.6}", term, score))?;
     }
     out.flush()?;
-    
+
     Ok(())
 }
 
@@ -767,19 +774,19 @@ fn cmd_similar(index: Index, args: Vec<String>) -> Result<()> {
     let n = parse_top(&args[1..], 10);
     let similar = index.similar_to(target, n)?;
     let mut out = PipeWriter::new();
-    
+
     for (path, score) in similar {
         out.writeln(&format!("{}\t{:.6}", path, score))?;
     }
     out.flush()?;
-    
+
     Ok(())
 }
 
-fn cmd_search(index: Index, index_path: String, args: Vec<String>) -> Result<()> {
+fn cmd_search(index: Index, args: Vec<String>) -> Result<()> {
     let n = parse_top(&args, 10);
     let stopwords = load_stopwords()?;
-    
+
     // Read query from stdin if args are empty, otherwise use first arg
     let query = if args.is_empty() || args[0] == "--top" {
         let mut buffer = String::new();
@@ -788,26 +795,20 @@ fn cmd_search(index: Index, index_path: String, args: Vec<String>) -> Result<()>
     } else {
         args[0].clone()
     };
-    
+
     if query.is_empty() {
         eprintln!("tfidf query search: empty query");
         std::process::exit(1);
     }
-    
+
     let results = index.search(&query, n, &stopwords);
     let mut out = PipeWriter::new();
-    
+
     for (path, score) in results {
         out.writeln(&format!("{}\t{:.6}", path, score))?;
     }
     out.flush()?;
-    
-    // Record search in state
-    let cwd = env::current_dir()?.to_string_lossy().into_owned();
-    let mut state = State::load().unwrap_or_default();
-    state.record_search(cwd, index_path, query);
-    state.save()?;
-    
+
     Ok(())
 }
 
@@ -817,36 +818,36 @@ fn print_usage() {
 tfidf - composable document similarity
 
 USAGE
-  tfidf save <index> [PATH...] [--]
+  tfidf save [--index <path>] [PATH...] [--]
   tfidf query [--index <path>] <subcommand>
 
 SAVE
   Build an index from files and directories.
+  If --index is not provided, the index path is resolved using the normal
+  index resolution cascade and will be created if it does not exist.
   After --, read additional paths from stdin (one per line).
 
 QUERY SUBCOMMANDS
-  list                    List all indexed documents
-  terms [--top N]         Show top N terms (default: 20)
+  list                      List all indexed documents
+  terms [--top N]           Show top N terms (default: 20)
   similar <file> [--top N]  Find similar documents (default: 10)
   search [query] [--top N]  Search by query string (default: 10)
-                           Reads from stdin if query not provided
+                            Reads from stdin if query not provided
 
 INDEX RESOLUTION
   1. --index flag
   2. TFIDF_INDEX environment variable
-  3. Last used index for current directory (from state)
-  4. $XDG_DATA_HOME/$TFIDF_APPNAME/index
-  5. ~/.local/share/$TFIDF_APPNAME/index
+  3. $TFIDF_DATA_DIR/tfidf.index
 
-STATE
-  Query history and index associations stored in:
-    $XDG_STATE_HOME/$TFIDF_APPNAME/state
-    ~/.local/state/$TFIDF_APPNAME/state
+TFIDF_DATA_DIR RESOLUTION
+  1. TFIDF_DATA_DIR
+  2. XDG_DATA_HOME/TFIDF_APPNAME
+  3. HOME/.local/share/TFIDF_APPNAME
 
 CONFIGURATION
   Stopwords: $XDG_CONFIG_HOME/$TFIDF_APPNAME/stopwords.txt
              (defaults to $XDG_CONFIG_HOME/tfidf/stopwords.txt)
-  
+
   Set TFIDF_APPNAME to use separate configurations:
     export TFIDF_APPNAME=project-docs
     mkdir -p ~/.config/project-docs
@@ -855,8 +856,12 @@ OUTPUT
   Tab-delimited for composition with cut, sort, xargs, etc.
 
 EXAMPLES
-  # Save index
-  tfidf save docs.index src/ notes/ --
+  # Save index using the default resolved index path
+  tfidf save src/ notes/ --
+
+  # Save index explicitly
+  tfidf save --index docs.index src/ notes/ --
+  tfidf save docs.index src/ notes/ --    # legacy positional index form
 
   # Query
   tfidf query list | head -5
@@ -864,9 +869,9 @@ EXAMPLES
   tfidf query similar main.rs | cut -f1 | xargs cat
   tfidf query search \"error handling rust\" --top 20
   echo \"memory management\" | tfidf query search --top 10
-  
+
   # Use separate configuration
-  TFIDF_APPNAME=work tfidf save work.index ~/work/docs
+  TFIDF_APPNAME=work tfidf save --index work.index ~/work/docs
 "
     );
 }
@@ -928,7 +933,7 @@ mod tests {
         let mut vec = FastMap::default();
         vec.insert("term1".to_string(), 1.0);
         vec.insert("term2".to_string(), 2.0);
-        
+
         let sim = cosine_similarity(&vec, &vec);
         assert!((sim - 1.0).abs() < 1e-10);
     }
@@ -937,10 +942,10 @@ mod tests {
     fn test_cosine_similarity_orthogonal() {
         let mut vec_a = FastMap::default();
         vec_a.insert("term1".to_string(), 1.0);
-        
+
         let mut vec_b = FastMap::default();
         vec_b.insert("term2".to_string(), 1.0);
-        
+
         let sim = cosine_similarity(&vec_a, &vec_b);
         assert_eq!(sim, 0.0);
     }
@@ -950,11 +955,11 @@ mod tests {
         let mut vec_a = FastMap::default();
         vec_a.insert("common".to_string(), 1.0);
         vec_a.insert("unique_a".to_string(), 1.0);
-        
+
         let mut vec_b = FastMap::default();
         vec_b.insert("common".to_string(), 1.0);
         vec_b.insert("unique_b".to_string(), 1.0);
-        
+
         let sim = cosine_similarity(&vec_a, &vec_b);
         // cos(θ) where both vectors have norm √2 and dot product 1
         let expected = 1.0 / 2.0;
@@ -966,7 +971,7 @@ mod tests {
         let vec_a = FastMap::default();
         let mut vec_b = FastMap::default();
         vec_b.insert("term".to_string(), 1.0);
-        
+
         let sim = cosine_similarity(&vec_a, &vec_b);
         assert_eq!(sim, 0.0);
     }
@@ -995,37 +1000,37 @@ mod tests {
         let mut doc1_terms = FastMap::default();
         doc1_terms.insert("rare".to_string(), 1);
         doc1_terms.insert("common".to_string(), 2);
-        
+
         let mut doc2_terms = FastMap::default();
         doc2_terms.insert("common".to_string(), 1);
-        
+
         let doc1 = Document {
             id: 0,
             path: "doc1".to_string(),
             terms: doc1_terms.clone(),
             length: 3,
         };
-        
+
         let doc2 = Document {
             id: 1,
             path: "doc2".to_string(),
             terms: doc2_terms.clone(),
             length: 1,
         };
-        
+
         let mut term_df = FastMap::default();
         term_df.insert("rare".to_string(), 1);
         term_df.insert("common".to_string(), 2);
-        
+
         let index = Index {
             docs: vec![doc1, doc2],
             term_df,
         };
-        
+
         // "rare" appears in 1 doc out of 2, "common" in 2 out of 2
         let rare_score = index.tfidf("rare", 1, 3);
         let common_score = index.tfidf("common", 2, 3);
-        
+
         // rare should have higher IDF
         assert!(rare_score > common_score);
     }
@@ -1055,7 +1060,7 @@ mod tests {
         stopwords.insert("the".to_string(), ());
         stopwords.insert("a".to_string(), ());
         stopwords.insert("an".to_string(), ());
-        
+
         let start = std::time::Instant::now();
         for _ in 0..10_000 {
             let _ = tokenize(text, &stopwords);
@@ -1068,44 +1073,50 @@ mod tests {
     fn bench_cosine_similarity_sparse() {
         let mut vec_a = FastMap::default();
         let mut vec_b = FastMap::default();
-        
+
         for i in 0..100 {
             vec_a.insert(format!("term_{}", i), i as f64);
             if i % 3 == 0 {
                 vec_b.insert(format!("term_{}", i), (i * 2) as f64);
             }
         }
-        
+
         let start = std::time::Instant::now();
         for _ in 0..100_000 {
             let _ = cosine_similarity(&vec_a, &vec_b);
         }
         let elapsed = start.elapsed();
-        println!("bench_cosine_similarity_sparse: {:?} (100k iterations)", elapsed);
+        println!(
+            "bench_cosine_similarity_sparse: {:?} (100k iterations)",
+            elapsed
+        );
     }
 
     #[test]
     fn bench_cosine_similarity_dense() {
         let mut vec_a = FastMap::default();
         let mut vec_b = FastMap::default();
-        
+
         for i in 0..100 {
             vec_a.insert(format!("term_{}", i), i as f64);
             vec_b.insert(format!("term_{}", i), (i * 2) as f64);
         }
-        
+
         let start = std::time::Instant::now();
         for _ in 0..100_000 {
             let _ = cosine_similarity(&vec_a, &vec_b);
         }
         let elapsed = start.elapsed();
-        println!("bench_cosine_similarity_dense: {:?} (100k iterations)", elapsed);
+        println!(
+            "bench_cosine_similarity_dense: {:?} (100k iterations)",
+            elapsed
+        );
     }
 
     #[test]
     fn bench_tfidf_computation() {
         let mut docs = Vec::new();
-        
+
         // Create synthetic corpus
         for doc_id in 0..100 {
             let mut terms = FastMap::default();
@@ -1122,16 +1133,16 @@ mod tests {
                 length,
             });
         }
-        
+
         let mut term_df = FastMap::default();
         for doc in &docs {
             for term in doc.terms.keys() {
                 *term_df.entry(term.clone()).or_insert(0) += 1;
             }
         }
-        
+
         let index = Index { docs, term_df };
-        
+
         let start = std::time::Instant::now();
         for _ in 0..1_000 {
             for doc in &index.docs {
@@ -1139,33 +1150,37 @@ mod tests {
             }
         }
         let elapsed = start.elapsed();
-        println!("bench_tfidf_computation: {:?} (1k iterations × 100 docs)", elapsed);
+        println!(
+            "bench_tfidf_computation: {:?} (1k iterations × 100 docs)",
+            elapsed
+        );
     }
 
     #[test]
     fn bench_large_corpus_index() {
         // Simulate realistic corpus: 1000 docs with repeated chunks
         let mut docs = Vec::new();
-        
-        let common_chunk: Vec<String> = (0..50)
-            .map(|i| format!("common_{}", i))
-            .collect();
-        
+
+        let common_chunk: Vec<String> = (0..50).map(|i| format!("common_{}", i)).collect();
+
         for doc_id in 0..1000 {
             let mut terms = FastMap::default();
-            
+
             // Add common terms (simulating repeated massive chunks)
             for term in &common_chunk {
                 *terms.entry(term.clone()).or_insert(0) += 100;
             }
-            
+
             // Add document-specific terms
             for term_id in 0..200 {
                 if term_id % (doc_id % 10 + 1) == 0 {
-                    terms.insert(format!("doc{}_term_{}", doc_id, term_id), (term_id % 20 + 1) as u32);
+                    terms.insert(
+                        format!("doc{}_term_{}", doc_id, term_id),
+                        (term_id % 20 + 1) as u32,
+                    );
                 }
             }
-            
+
             let length = terms.values().sum();
             docs.push(Document {
                 id: doc_id,
@@ -1174,38 +1189,47 @@ mod tests {
                 length,
             });
         }
-        
+
         let mut term_df = FastMap::default();
         for doc in &docs {
             for term in doc.terms.keys() {
                 *term_df.entry(term.clone()).or_insert(0) += 1;
             }
         }
-        
+
         let index = Index { docs, term_df };
-        
+
         let start = std::time::Instant::now();
         let _ = index.vector(&index.docs[0]);
         let elapsed = start.elapsed();
-        println!("bench_large_corpus_index: vector computation on 1k doc corpus: {:?}", elapsed);
-        
+        println!(
+            "bench_large_corpus_index: vector computation on 1k doc corpus: {:?}",
+            elapsed
+        );
+
         let start = std::time::Instant::now();
         let _ = index.similar_to("doc_0.txt", 10).unwrap();
         let elapsed = start.elapsed();
-        println!("bench_large_corpus_index: similarity search across 1k docs: {:?}", elapsed);
+        println!(
+            "bench_large_corpus_index: similarity search across 1k docs: {:?}",
+            elapsed
+        );
     }
 
     #[test]
     fn bench_similar_to() {
         let mut docs = Vec::new();
-        
+
         // Create synthetic corpus with some overlap
         for doc_id in 0..50 {
             let mut terms = FastMap::default();
             for term_id in 0..100 {
                 // Create overlap patterns
                 if term_id < 20 || term_id % (doc_id + 1) == 0 {
-                    terms.insert(format!("term_{}", term_id), ((term_id + doc_id) % 10 + 1) as u32);
+                    terms.insert(
+                        format!("term_{}", term_id),
+                        ((term_id + doc_id) % 10 + 1) as u32,
+                    );
                 }
             }
             let length = terms.values().sum();
@@ -1216,16 +1240,16 @@ mod tests {
                 length,
             });
         }
-        
+
         let mut term_df = FastMap::default();
         for doc in &docs {
             for term in doc.terms.keys() {
                 *term_df.entry(term.clone()).or_insert(0) += 1;
             }
         }
-        
+
         let index = Index { docs, term_df };
-        
+
         let start = std::time::Instant::now();
         for _ in 0..100 {
             let _ = index.similar_to("doc_0.txt", 10).unwrap();
@@ -1237,7 +1261,7 @@ mod tests {
     #[test]
     fn bench_top_terms() {
         let mut docs = Vec::new();
-        
+
         for doc_id in 0..100 {
             let mut terms = FastMap::default();
             for term_id in 0..200 {
@@ -1253,16 +1277,16 @@ mod tests {
                 length,
             });
         }
-        
+
         let mut term_df = FastMap::default();
         for doc in &docs {
             for term in doc.terms.keys() {
                 *term_df.entry(term.clone()).or_insert(0) += 1;
             }
         }
-        
+
         let index = Index { docs, term_df };
-        
+
         let start = std::time::Instant::now();
         for _ in 0..1_000 {
             let _ = index.top_terms(20);
