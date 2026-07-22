@@ -1,0 +1,547 @@
+.TH TFIDF 1 "June 2026" "tfidf-rs 0.0.3" "User Commands"
+.SH NAME
+tfidf \- composable TF-IDF document indexing and similarity search
+.SH SYNOPSIS
+.B tfidf
+.B save
+[\fB--index\fR \fIPATH\fR]
+[\fIPATH\fR...]
+[\fB--\fR]
+.PP
+.B tfidf
+.B save
+.I INDEX
+[\fIPATH\fR...]
+[\fB--\fR]
+.PP
+.B tfidf
+.B query
+[\fB--index\fR \fIPATH\fR]
+.B list
+.PP
+.B tfidf
+.B query
+[\fB--index\fR \fIPATH\fR]
+.B terms
+[\fB--top\fR \fIN\fR]
+.PP
+.B tfidf
+.B query
+[\fB--index\fR \fIPATH\fR]
+.B similar
+.I FILE
+[\fB--top\fR \fIN\fR]
+.PP
+.B tfidf
+.B query
+[\fB--index\fR \fIPATH\fR]
+.B search
+[\fIQUERY\fR]
+[\fB--top\fR \fIN\fR]
+.SH DESCRIPTION
+.B tfidf
+builds a serialized TF-IDF index from files and directories, then queries it
+using pipe-friendly commands.
+.PP
+The program is designed for shell composition. Normal query output is plain
+tab-delimited text with no decoration, progress display, or implicit stdout
+formatting. Broken pipes are handled gracefully, so commands such as
+.BR head (1)
+and
+.BR tail (1)
+can terminate pipelines without noisy diagnostics.
+.PP
+Documents are tokenized into ASCII word tokens, lowercased, optionally filtered
+through a stopword file, and represented as sparse TF-IDF vectors. Similarity is
+computed using cosine similarity.
+.SH COMMANDS
+.SS save
+.B tfidf save
+builds an index from one or more input files or directories and writes it to the
+resolved index path.
+.PP
+If an input path is a directory, it is walked recursively. Regular files found
+beneath it are included in the corpus. Files that cannot be read or that produce
+no tokens are skipped.
+.PP
+If
+.B --index
+is supplied, that path is used for the output index. Otherwise
+.B TFIDF_INDEX
+or the default data-dir index path is used.
+.PP
+For compatibility,
+.B tfidf save INDEX PATH...
+is also accepted. The first positional argument is treated as a legacy index path
+when it looks like an index file, has extension
+.BR .index ,
+has basename
+.B index
+or
+.BR tfidf.index ,
+or when it does not exist and at least one more positional argument is present.
+.PP
+If
+.B --
+appears, additional input paths are read from standard input, one path per line.
+Empty lines are ignored.
+.SS query list
+Lists all document paths stored in the index.
+.PP
+Output format:
+.PP
+.RS
+.nf
+PATH
+.fi
+.RE
+.SS query terms
+Shows the top terms by aggregate TF-IDF score across all indexed documents.
+.PP
+Output format:
+.PP
+.RS
+.nf
+TERM<TAB>SCORE
+.fi
+.RE
+.PP
+Scores are printed with six digits after the decimal point.
+.SS query similar
+Finds documents similar to the indexed document named by
+.IR FILE .
+.PP
+The file argument must exactly match the stored document path in the index.
+Use
+.B tfidf query list
+to inspect indexed paths.
+.PP
+Output format:
+.PP
+.RS
+.nf
+PATH<TAB>SCORE
+.fi
+.RE
+.PP
+Only positive similarity scores are emitted.
+.SS query search
+Searches indexed documents using a query string. The query is tokenized with the
+same tokenizer and stopword configuration used for indexing.
+.PP
+If
+.I QUERY
+is omitted, or if the first argument is
+.BR --top ,
+the query text is read from standard input.
+.PP
+When passing a multi-word query as an argument, quote it in the shell:
+.PP
+.RS
+.nf
+tfidf query search "error handling rust"
+.fi
+.RE
+.PP
+Output format:
+.PP
+.RS
+.nf
+PATH<TAB>SCORE
+.fi
+.RE
+.PP
+Only positive similarity scores are emitted.
+.SH OPTIONS
+.TP
+.BI --index " PATH"
+Use
+.I PATH
+as the index file. This option is recognized by both
+.B save
+and
+.BR query .
+It has the highest precedence in index path resolution.
+.TP
+.BI --top " N"
+Limit result count to
+.IR N .
+Supported by
+.BR terms ,
+.BR similar ,
+and
+.BR search .
+If omitted or invalid, the command default is used.
+.TP
+.BR -h ", " --help
+Print usage information.
+.SH DEFAULTS
+.TP
+Default application name
+.B tfidf
+.TP
+Default index file name
+.B tfidf.index
+.TP
+Default number of terms
+.B tfidf query terms
+prints 20 terms.
+.TP
+Default number of similar documents
+.B tfidf query similar
+prints 10 documents.
+.TP
+Default number of search results
+.B tfidf query search
+prints 10 documents.
+.TP
+Default stopword behavior
+No stopwords are used unless a stopword file exists in the configured location.
+.SH INDEX PATH RESOLUTION
+The index path is resolved in this order:
+.IP "1." 4
+.B --index
+.IR PATH .
+.IP "2." 4
+.B TFIDF_INDEX
+environment variable.
+.IP "3." 4
+The default XDG-style data path:
+.PP
+.RS
+.nf
+$(tfidf data dir)/tfidf.index
+.fi
+.RE
+.PP
+The TF-IDF data directory is resolved in this order:
+.IP "1." 4
+.B TFIDF_DATA_DIR
+as an explicit directory. When this variable is set, the application name is not
+appended.
+.IP "2." 4
+.BR XDG_DATA_HOME / TFIDF_APPNAME
+.IP "3." 4
+.BR HOME /.local/share/ TFIDF_APPNAME
+.IP "4." 4
+.BR ./ TFIDF_APPNAME
+if no home directory is available.
+.PP
+.B TFIDF_APPNAME
+defaults to
+.BR tfidf .
+.SH CONFIGURATION FILES
+.SS Stopwords
+Stopwords are loaded from the first existing file in this order:
+.IP "1." 4
+.BR XDG_CONFIG_HOME / TFIDF_APPNAME /stopwords.txt
+.IP "2." 4
+.BR HOME /.config/ TFIDF_APPNAME /stopwords.txt
+.PP
+The stopword file is line-oriented. Each non-empty line is trimmed, lowercased,
+and treated as one stopword.
+.PP
+Example:
+.PP
+.RS
+.nf
+the
+a
+an
+of
+and
+.fi
+.RE
+.SH ENVIRONMENT
+.TP
+.B TFIDF_INDEX
+Default index file path used when
+.B --index
+is not supplied.
+.TP
+.B TFIDF_DATA_DIR
+Base data directory used to construct the default index path. If set, the
+default index path is:
+.PP
+.RS
+.nf
+$TFIDF_DATA_DIR/tfidf.index
+.fi
+.RE
+.TP
+.B TFIDF_APPNAME
+Application namespace for XDG data and config paths. Defaults to
+.BR tfidf .
+Set this to maintain separate indexes and stopword configurations for different
+projects.
+.TP
+.B XDG_DATA_HOME
+Used when
+.B TFIDF_DATA_DIR
+is unset. The data directory becomes:
+.PP
+.RS
+.nf
+$XDG_DATA_HOME/$TFIDF_APPNAME
+.fi
+.RE
+.TP
+.B XDG_CONFIG_HOME
+Used to locate stopwords:
+.PP
+.RS
+.nf
+$XDG_CONFIG_HOME/$TFIDF_APPNAME/stopwords.txt
+.fi
+.RE
+.TP
+.B HOME
+Used as a fallback for data and config paths:
+.PP
+.RS
+.nf
+$HOME/.local/share/$TFIDF_APPNAME/tfidf.index
+$HOME/.config/$TFIDF_APPNAME/stopwords.txt
+.fi
+.RE
+.SH TOKENIZATION
+Input bytes are split into word tokens.
+.PP
+A word byte is:
+.IP \(bu 2
+ASCII alphabetic,
+.IP \(bu 2
+ASCII digit, or
+.IP \(bu 2
+underscore.
+.PP
+ASCII alphabetic bytes are lowercased. Other bytes delimit tokens.
+.PP
+For example:
+.PP
+.RS
+.nf
+Hello, world! test-case
+.fi
+.RE
+.PP
+becomes:
+.PP
+.RS
+.nf
+hello
+world
+test
+case
+.fi
+.RE
+.PP
+The tokenizer is ASCII-oriented. Non-ASCII bytes are token delimiters.
+.SH SCORING
+Term frequency is computed as:
+.PP
+.RS
+.nf
+TF(t,d) = count(t,d) / |d|
+.fi
+.RE
+.PP
+Inverse document frequency is computed with smoothing:
+.PP
+.RS
+.nf
+IDF(t) = ln((D + 1) / (df(t) + 1))
+.fi
+.RE
+.PP
+TF-IDF is:
+.PP
+.RS
+.nf
+TFIDF(t,d) = TF(t,d) * IDF(t)
+.fi
+.RE
+.PP
+Document similarity is cosine similarity over sparse TF-IDF vectors:
+.PP
+.RS
+.nf
+cos(a,b) = (a . b) / (||a|| ||b||)
+.fi
+.RE
+.SH OUTPUT
+All normal query output is suitable for common shell tools such as
+.BR cut (1),
+.BR sort (1),
+.BR awk (1),
+.BR xargs (1),
+and
+.BR head (1).
+.PP
+No headers are printed. Scores use fixed six-decimal formatting.
+.PP
+Diagnostic messages and usage text are written to standard error.
+.SH EXAMPLES
+Build an index using the default resolved index path:
+.PP
+.RS
+.nf
+tfidf save src/ notes/
+.fi
+.RE
+.PP
+Build an index explicitly:
+.PP
+.RS
+.nf
+tfidf save --index docs.index src/ notes/
+.fi
+.RE
+.PP
+Use the legacy positional index form:
+.PP
+.RS
+.nf
+tfidf save docs.index src/ notes/
+.fi
+.RE
+.PP
+Read paths from standard input:
+.PP
+.RS
+.nf
+find src notes -type f | tfidf save --index docs.index --
+.fi
+.RE
+.PP
+List indexed documents:
+.PP
+.RS
+.nf
+tfidf query --index docs.index list
+.fi
+.RE
+.PP
+Show the top 100 terms:
+.PP
+.RS
+.nf
+tfidf query --index docs.index terms --top 100
+.fi
+.RE
+.PP
+Sort terms by score:
+.PP
+.RS
+.nf
+tfidf query terms --top 100 | sort -k2,2nr
+.fi
+.RE
+.PP
+Find documents similar to an indexed file:
+.PP
+.RS
+.nf
+tfidf query similar src/main.rs --top 10
+.fi
+.RE
+.PP
+Open similar files through a pipeline:
+.PP
+.RS
+.nf
+tfidf query similar src/main.rs | cut -f1 | xargs ${PAGER:-less}
+.fi
+.RE
+.PP
+Search with a quoted query string:
+.PP
+.RS
+.nf
+tfidf query search "error handling rust" --top 20
+.fi
+.RE
+.PP
+Search with query text from standard input:
+.PP
+.RS
+.nf
+echo "memory management" | tfidf query search --top 10
+.fi
+.RE
+.PP
+Use an environment-selected index:
+.PP
+.RS
+.nf
+export TFIDF_INDEX=$PWD/docs.index
+tfidf save src/ notes/
+tfidf query terms
+.fi
+.RE
+.PP
+Use a separate application namespace:
+.PP
+.RS
+.nf
+export TFIDF_APPNAME=project-docs
+mkdir -p ~/.config/project-docs
+printf '%s\\n' the and of > ~/.config/project-docs/stopwords.txt
+tfidf save ~/work/docs
+.fi
+.RE
+.SH FILES
+.TP
+.BR $TFIDF_DATA_DIR/tfidf.index
+Default index path when
+.B TFIDF_DATA_DIR
+is set.
+.TP
+.BR $XDG_DATA_HOME/$TFIDF_APPNAME/tfidf.index
+Default index path when
+.B XDG_DATA_HOME
+is set and
+.B TFIDF_DATA_DIR
+is unset.
+.TP
+.BR $HOME/.local/share/$TFIDF_APPNAME/tfidf.index
+Fallback default index path.
+.TP
+.BR $XDG_CONFIG_HOME/$TFIDF_APPNAME/stopwords.txt
+Primary stopword file.
+.TP
+.BR $HOME/.config/$TFIDF_APPNAME/stopwords.txt
+Fallback stopword file.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Usage error, missing input paths, missing index, empty search query, unknown
+command, or another fatal error.
+.PP
+When stdout is closed by a downstream command in a pipeline,
+.B tfidf
+exits successfully without printing a broken-pipe error.
+.SH NOTES
+The index is serialized with
+.BR bincode .
+The on-disk format is an implementation detail and should not be treated as a
+stable interchange format.
+.PP
+Index creation replaces the target index file. Incremental update operations are
+not currently exposed.
+.PP
+The
+.B search
+command uses the first non-option query argument as the query string. Quote
+multi-word queries so they are passed as one shell argument, or pipe the query on
+standard input.
+.SH SEE ALSO
+.BR find (1),
+.BR cut (1),
+.BR sort (1),
+.BR awk (1),
+.BR xargs (1),
+.BR head (1)
