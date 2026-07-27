@@ -1,92 +1,155 @@
-.TH TFIDF 1 "June 2026" "tfidf-rs 0.0.3" "User Commands"
+.\" tfidf(1) manual page
+.TH TFIDF 1 "2026-07-27" "tfidf-rs 0.0.3" "User Commands"
+
 .SH NAME
 tfidf \- composable TF-IDF document indexing and similarity search
+
 .SH SYNOPSIS
 .B tfidf
 .B save
-[\fB--index\fR \fIPATH\fR]
-[\fIPATH\fR...]
-[\fB--\fR]
+.RB [ \-\-index
+.IR PATH ]
+.RI [ PATH ...]
+.RB [ \-\- ]
 .PP
 .B tfidf
 .B save
 .I INDEX
-[\fIPATH\fR...]
-[\fB--\fR]
+.RI [ PATH ...]
+.RB [ \-\- ]
 .PP
 .B tfidf
 .B query
-[\fB--index\fR \fIPATH\fR]
+.RB [ \-\-index
+.IR PATH ]
 .B list
 .PP
 .B tfidf
 .B query
-[\fB--index\fR \fIPATH\fR]
+.RB [ \-\-index
+.IR PATH ]
 .B terms
-[\fB--top\fR \fIN\fR]
+.RB [ \-\-top
+.IR N ]
 .PP
 .B tfidf
 .B query
-[\fB--index\fR \fIPATH\fR]
+.RB [ \-\-index
+.IR PATH ]
 .B similar
 .I FILE
-[\fB--top\fR \fIN\fR]
+.RB [ \-\-top
+.IR N ]
 .PP
 .B tfidf
 .B query
-[\fB--index\fR \fIPATH\fR]
+.RB [ \-\-index
+.IR PATH ]
 .B search
-[\fIQUERY\fR]
-[\fB--top\fR \fIN\fR]
+.RI [ QUERY ]
+.RB [ \-\-top
+.IR N ]
+.PP
+.B tfidf
+.RB [ \-h | \-\-help ]
+
 .SH DESCRIPTION
 .B tfidf
-builds a serialized TF-IDF index from files and directories, then queries it
-using pipe-friendly commands.
+builds a serialized TF-IDF index from files and directories and queries that
+index for document paths, aggregate term scores, similar documents, or search
+results.
 .PP
-The program is designed for shell composition. Normal query output is plain
-tab-delimited text with no decoration, progress display, or implicit stdout
-formatting. Broken pipes are handled gracefully, so commands such as
-.BR head (1)
+The program is intended for shell composition. Query output has no headers,
+progress indicators, or decorative formatting. Output containing scores is
+tab-delimited and can be processed with tools such as
+.BR cut (1),
+.BR sort (1),
+.BR awk (1),
+.BR xargs (1),
 and
-.BR tail (1)
-can terminate pipelines without noisy diagnostics.
+.BR head (1).
 .PP
-Documents are tokenized into ASCII word tokens, lowercased, optionally filtered
-through a stopword file, and represented as sparse TF-IDF vectors. Similarity is
-computed using cosine similarity.
+Broken output pipes are treated as successful termination. A downstream command
+such as
+.BR head (1)
+may therefore close the pipe without causing a broken-pipe diagnostic.
+.PP
+Directories passed to
+.B save
+are walked recursively. Regular files are tokenized and represented as sparse
+term-frequency maps. Files that cannot be read and files that produce no tokens
+are skipped.
+
 .SH COMMANDS
+
 .SS save
 .B tfidf save
-builds an index from one or more input files or directories and writes it to the
+builds an index from the supplied files and directories and writes it to the
 resolved index path.
 .PP
-If an input path is a directory, it is walked recursively. Regular files found
-beneath it are included in the corpus. Files that cannot be read or that produce
-no tokens are skipped.
+If an input path is a directory, regular files below it are discovered
+recursively. An error while reading a directory is fatal. A regular file that
+cannot be read is silently skipped.
+.PP
+Paths that are neither regular files nor directories, including nonexistent
+paths, are ignored. If arguments were supplied but none produce indexable
+documents, an empty index may be written.
+.PP
+The parent directory of the output index is created automatically when needed.
+An existing index file is replaced. The update is not incremental and is not
+performed as an atomic file replacement.
 .PP
 If
-.B --index
-is supplied, that path is used for the output index. Otherwise
-.B TFIDF_INDEX
-or the default data-dir index path is used.
+.B \-\-index
+is supplied, its argument is the output index path. Otherwise the path is
+selected according to
+.BR "INDEX PATH RESOLUTION" .
 .PP
-For compatibility,
-.B tfidf save INDEX PATH...
-is also accepted. The first positional argument is treated as a legacy index path
-when it looks like an index file, has extension
-.BR .index ,
-has basename
+If
+.B \-\-
+appears, additional input paths are read from standard input, one path per
+line. Leading and trailing whitespace is removed and empty lines are ignored.
+Command-line arguments following the first
+.B \-\-
+are not processed as paths.
+.PP
+For compatibility, the following positional form is also accepted:
+.PP
+.RS
+.B tfidf save
+.I INDEX
+.RI [ PATH ...]
+.RB [ \-\- ]
+.RE
+.PP
+The first positional argument is treated as a legacy index path when at least
+one more positional argument is present and one of the following is true:
+.IP \(bu 2
+its basename is
 .B index
 or
-.BR tfidf.index ,
-or when it does not exist and at least one more positional argument is present.
+.BR tfidf.index ;
+.IP \(bu 2
+its extension is
+.BR .index ;
+.IP \(bu 2
+the path does not currently exist.
 .PP
-If
-.B --
-appears, additional input paths are read from standard input, one path per line.
-Empty lines are ignored.
+This heuristic is ambiguous. For example, in:
+.PP
+.RS
+.B tfidf save new-file existing-file
+.RE
+.PP
+if
+.B new-file
+does not exist, it is treated as the output index rather than an input path.
+Use
+.B \-\-index
+to avoid ambiguity.
+
 .SS query list
-Lists all document paths stored in the index.
+Print every document path stored in the index, one path per line.
 .PP
 Output format:
 .PP
@@ -95,8 +158,11 @@ Output format:
 PATH
 .fi
 .RE
+
 .SS query terms
-Shows the top terms by aggregate TF-IDF score across all indexed documents.
+Print the top terms by aggregate TF-IDF score across all indexed documents.
+.PP
+The default result count is 20.
 .PP
 Output format:
 .PP
@@ -107,14 +173,21 @@ TERM<TAB>SCORE
 .RE
 .PP
 Scores are printed with six digits after the decimal point.
+
 .SS query similar
-Finds documents similar to the indexed document named by
-.IR FILE .
+Find indexed documents similar to
+.I FILE
+using cosine similarity over TF-IDF vectors.
 .PP
-The file argument must exactly match the stored document path in the index.
-Use
-.B tfidf query list
-to inspect indexed paths.
+.I FILE
+must exactly match a path stored in the index. Use
+.B query list
+to inspect the stored paths.
+.PP
+The target document itself is excluded. Documents whose computed similarity is
+zero are not printed.
+.PP
+The default result count is 10.
 .PP
 Output format:
 .PP
@@ -123,25 +196,39 @@ Output format:
 PATH<TAB>SCORE
 .fi
 .RE
-.PP
-Only positive similarity scores are emitted.
+
 .SS query search
-Searches indexed documents using a query string. The query is tokenized with the
-same tokenizer and stopword configuration used for indexing.
+Search indexed documents using a query string.
 .PP
 If
 .I QUERY
-is omitted, or if the first argument is
-.BR --top ,
-the query text is read from standard input.
+is omitted, or if the first remaining argument is
+.BR \-\-top ,
+the query text is read from standard input. Leading and trailing whitespace is
+removed.
 .PP
-When passing a multi-word query as an argument, quote it in the shell:
+When a query is supplied as an argument, only the first query argument is used.
+A multi-word query must therefore be quoted by the shell:
 .PP
 .RS
 .nf
-tfidf query search "error handling rust"
+tfidf query search "error handling rust" --top 20
 .fi
 .RE
+.PP
+Search reloads the current stopword file when the command runs. The index does
+not store the stopword configuration used during
+.BR save .
+Changing the stopword file after building the index can therefore make search
+query tokenization differ from indexing-time tokenization.
+.PP
+An empty query, including one containing only delimiters or configured
+stopwords, produces no results. A textually empty query is reported as an
+error.
+.PP
+Only documents with a positive cosine-similarity score are printed.
+.PP
+The default result count is 10.
 .PP
 Output format:
 .PP
@@ -150,118 +237,133 @@ Output format:
 PATH<TAB>SCORE
 .fi
 .RE
-.PP
-Only positive similarity scores are emitted.
+
 .SH OPTIONS
 .TP
-.BI --index " PATH"
+.BI \-\-index " PATH"
 Use
 .I PATH
-as the index file. This option is recognized by both
+as the index file.
+.PP
+For
 .B save
-and
-.BR query .
-It has the highest precedence in index path resolution.
+the index is written to this path. For
+.B query
+the index is loaded from this path.
+.PP
+This option has precedence over
+.B TFIDF_INDEX
+and the default data-directory path.
 .TP
-.BI --top " N"
-Limit result count to
-.IR N .
-Supported by
+.BI \-\-top " N"
+Limit the number of results for
 .BR terms ,
 .BR similar ,
+or
+.BR search .
+.PP
+The default is 20 for
+.B terms
+and 10 for
+.B similar
 and
 .BR search .
-If omitted or invalid, the command default is used.
+.PP
+If
+.I N
+cannot be parsed as a nonnegative platform-sized integer, the command default
+is used. A value of zero produces no output.
 .TP
-.BR -h ", " --help
-Print usage information.
-.SH DEFAULTS
+.B \-\-
+For
+.BR save ,
+stop processing command-line paths and read additional paths from standard
+input.
 .TP
-Default application name
-.B tfidf
-.TP
-Default index file name
-.B tfidf.index
-.TP
-Default number of terms
-.B tfidf query terms
-prints 20 terms.
-.TP
-Default number of similar documents
-.B tfidf query similar
-prints 10 documents.
-.TP
-Default number of search results
-.B tfidf query search
-prints 10 documents.
-.TP
-Default stopword behavior
-No stopwords are used unless a stopword file exists in the configured location.
+.BR \-h ", " \-\-help
+Print usage information to standard error and exit successfully.
+.PP
+These help operands are recognized only when they are the first top-level
+argument. Subcommand-specific help operands are not implemented.
+
 .SH INDEX PATH RESOLUTION
 The index path is resolved in this order:
 .IP "1." 4
-.B --index
-.IR PATH .
+The path supplied by
+.BR \-\-index .
 .IP "2." 4
-.B TFIDF_INDEX
-environment variable.
+The value of
+.BR TFIDF_INDEX ,
+if nonempty.
 .IP "3." 4
-The default XDG-style data path:
+The default index path:
 .PP
 .RS
 .nf
-$(tfidf data dir)/tfidf.index
+DATA_DIRECTORY/tfidf.index
 .fi
 .RE
-.PP
-The TF-IDF data directory is resolved in this order:
+
+.SH DATA DIRECTORY RESOLUTION
+The default data directory is resolved in this order:
 .IP "1." 4
-.B TFIDF_DATA_DIR
-as an explicit directory. When this variable is set, the application name is not
-appended.
+.BR TFIDF_DATA_DIR ,
+if nonempty. The application name is not appended to this value.
 .IP "2." 4
-.BR XDG_DATA_HOME / TFIDF_APPNAME
+.BR XDG_DATA_HOME / TFIDF_APPNAME ,
+if
+.B XDG_DATA_HOME
+is nonempty.
 .IP "3." 4
-.BR HOME /.local/share/ TFIDF_APPNAME
+.BR HOME /.local/share/ TFIDF_APPNAME ,
+if
+.B HOME
+is nonempty.
 .IP "4." 4
-.BR ./ TFIDF_APPNAME
-if no home directory is available.
+.BR CURRENT_DIRECTORY / TFIDF_APPNAME ,
+if no usable
+.B HOME
+value is available.
 .PP
 .B TFIDF_APPNAME
 defaults to
 .BR tfidf .
+
 .SH CONFIGURATION FILES
+
 .SS Stopwords
-Stopwords are loaded from the first existing file in this order:
+The first existing stopword file in the following order is loaded:
 .IP "1." 4
 .BR XDG_CONFIG_HOME / TFIDF_APPNAME /stopwords.txt
 .IP "2." 4
 .BR HOME /.config/ TFIDF_APPNAME /stopwords.txt
 .PP
-The stopword file is line-oriented. Each non-empty line is trimmed, lowercased,
-and treated as one stopword.
+An unset or empty
+.B XDG_CONFIG_HOME
+or
+.B HOME
+does not contribute a candidate path.
 .PP
-Example:
+The file is read one line at a time. Each line is trimmed and lowercased.
+Nonempty lines are added as stopwords.
 .PP
-.RS
-.nf
-the
-a
-an
-of
+If no stopword file exists, an empty stopword set is used.
+.PP
+Stopwords are loaded independently during
+.B save
 and
-.fi
-.RE
+.BR "query search" .
+They are not embedded in the serialized index.
+
 .SH ENVIRONMENT
 .TP
 .B TFIDF_INDEX
-Default index file path used when
-.B --index
+Index file used when
+.B \-\-index
 is not supplied.
 .TP
 .B TFIDF_DATA_DIR
-Base data directory used to construct the default index path. If set, the
-default index path is:
+Explicit default data directory. When set, the default index path is:
 .PP
 .RS
 .nf
@@ -270,24 +372,25 @@ $TFIDF_DATA_DIR/tfidf.index
 .RE
 .TP
 .B TFIDF_APPNAME
-Application namespace for XDG data and config paths. Defaults to
+Application namespace used in XDG-style data and configuration paths. The
+default value is
 .BR tfidf .
-Set this to maintain separate indexes and stopword configurations for different
-projects.
 .TP
 .B XDG_DATA_HOME
-Used when
-.B TFIDF_DATA_DIR
-is unset. The data directory becomes:
+Used to construct:
 .PP
 .RS
 .nf
-$XDG_DATA_HOME/$TFIDF_APPNAME
+$XDG_DATA_HOME/$TFIDF_APPNAME/tfidf.index
 .fi
 .RE
+.PP
+when
+.B TFIDF_DATA_DIR
+is unset or empty.
 .TP
 .B XDG_CONFIG_HOME
-Used to locate stopwords:
+Used to locate:
 .PP
 .RS
 .nf
@@ -296,7 +399,7 @@ $XDG_CONFIG_HOME/$TFIDF_APPNAME/stopwords.txt
 .RE
 .TP
 .B HOME
-Used as a fallback for data and config paths:
+Used for the fallback data and stopword paths:
 .PP
 .RS
 .nf
@@ -304,18 +407,43 @@ $HOME/.local/share/$TFIDF_APPNAME/tfidf.index
 $HOME/.config/$TFIDF_APPNAME/stopwords.txt
 .fi
 .RE
+
+.SH DEFAULTS
+.TP
+Application name
+.B tfidf
+.TP
+Index filename
+.B tfidf.index
+.TP
+.B query terms
+result count
+.B 20
+.TP
+.B query similar
+result count
+.B 10
+.TP
+.B query search
+result count
+.B 10
+.TP
+Stopwords
+No stopwords are used if no configured stopword file exists.
+
 .SH TOKENIZATION
-Input bytes are split into word tokens.
+Input is tokenized byte by byte.
 .PP
-A word byte is:
+A word token consists of:
 .IP \(bu 2
-ASCII alphabetic,
+ASCII letters;
 .IP \(bu 2
-ASCII digit, or
+ASCII digits;
 .IP \(bu 2
 underscore.
 .PP
-ASCII alphabetic bytes are lowercased. Other bytes delimit tokens.
+ASCII letters are lowercased. Every other byte is a token delimiter. The
+tokenizer is ASCII-oriented; non-ASCII bytes delimit tokens.
 .PP
 For example:
 .PP
@@ -325,7 +453,7 @@ Hello, world! test-case
 .fi
 .RE
 .PP
-becomes:
+is tokenized as:
 .PP
 .RS
 .nf
@@ -335,10 +463,13 @@ test
 case
 .fi
 .RE
-.PP
-The tokenizer is ASCII-oriented. Non-ASCII bytes are token delimiters.
+
 .SH SCORING
-Term frequency is computed as:
+For a term
+.I t
+and document
+.IR d ,
+term frequency is:
 .PP
 .RS
 .nf
@@ -346,7 +477,7 @@ TF(t,d) = count(t,d) / |d|
 .fi
 .RE
 .PP
-Inverse document frequency is computed with smoothing:
+Inverse document frequency is:
 .PP
 .RS
 .nf
@@ -354,7 +485,13 @@ IDF(t) = ln((D + 1) / (df(t) + 1))
 .fi
 .RE
 .PP
-TF-IDF is:
+where
+.I D
+is the number of indexed documents and
+.I df(t)
+is the number of indexed documents containing the term.
+.PP
+The term score is:
 .PP
 .RS
 .nf
@@ -362,27 +499,107 @@ TFIDF(t,d) = TF(t,d) * IDF(t)
 .fi
 .RE
 .PP
-Document similarity is cosine similarity over sparse TF-IDF vectors:
+.B similar
+and
+.B search
+rank documents using cosine similarity:
 .PP
 .RS
 .nf
 cos(a,b) = (a . b) / (||a|| ||b||)
 .fi
 .RE
+.PP
+A zero vector has similarity zero. Terms occurring in every indexed document
+receive an IDF of zero.
+
 .SH OUTPUT
-All normal query output is suitable for common shell tools such as
-.BR cut (1),
-.BR sort (1),
-.BR awk (1),
-.BR xargs (1),
+Normal query output is written to standard output without headers.
+.PP
+.B query list
+prints:
+.PP
+.RS
+.nf
+PATH
+.fi
+.RE
+.PP
+.B query terms
+prints:
+.PP
+.RS
+.nf
+TERM<TAB>SCORE
+.fi
+.RE
+.PP
+.B query similar
 and
-.BR head (1).
+.B query search
+print:
 .PP
-No headers are printed. Scores use fixed six-decimal formatting.
+.RS
+.nf
+PATH<TAB>SCORE
+.fi
+.RE
 .PP
-Diagnostic messages and usage text are written to standard error.
+Scores use fixed six-decimal formatting.
+.PP
+Usage messages and explicit command diagnostics are written to standard error.
+Fatal errors returned by filesystem, I/O, or serialization operations are
+reported by the Rust runtime.
+.PP
+A broken standard-output pipe causes successful termination without a
+broken-pipe diagnostic.
+
+.SH FILES
+.TP
+.B $TFIDF_DATA_DIR/tfidf.index
+Default index when
+.B TFIDF_DATA_DIR
+is set.
+.TP
+.B $XDG_DATA_HOME/$TFIDF_APPNAME/tfidf.index
+Default index when
+.B TFIDF_DATA_DIR
+is unset and
+.B XDG_DATA_HOME
+is set.
+.TP
+.B $HOME/.local/share/$TFIDF_APPNAME/tfidf.index
+Default index when neither
+.B TFIDF_DATA_DIR
+nor
+.B XDG_DATA_HOME
+is set and
+.B HOME
+is available.
+.TP
+.B ./$TFIDF_APPNAME/tfidf.index
+Fallback index when no usable
+.B HOME
+value is available.
+.TP
+.B $XDG_CONFIG_HOME/$TFIDF_APPNAME/stopwords.txt
+Primary stopword file.
+.TP
+.B $HOME/.config/$TFIDF_APPNAME/stopwords.txt
+Fallback stopword file.
+
+.SH EXIT STATUS
+.TP
+.B 0
+Success, including top-level help and termination caused by a closed output
+pipe.
+.TP
+.B nonzero
+Invalid command usage, missing save inputs, missing index, empty search query,
+unknown command, filesystem failure, I/O failure, or serialization failure.
+
 .SH EXAMPLES
-Build an index using the default resolved index path:
+Build an index using the default resolved path:
 .PP
 .RS
 .nf
@@ -406,11 +623,19 @@ tfidf save docs.index src/ notes/
 .fi
 .RE
 .PP
-Read paths from standard input:
+Read input paths from standard input:
 .PP
 .RS
 .nf
 find src notes -type f | tfidf save --index docs.index --
+.fi
+.RE
+.PP
+Mix command-line and standard-input paths:
+.PP
+.RS
+.nf
+find notes -type f | tfidf save --index docs.index src/ --
 .fi
 .RE
 .PP
@@ -422,7 +647,7 @@ tfidf query --index docs.index list
 .fi
 .RE
 .PP
-Show the top 100 terms:
+Print the top 100 terms:
 .PP
 .RS
 .nf
@@ -430,7 +655,7 @@ tfidf query --index docs.index terms --top 100
 .fi
 .RE
 .PP
-Sort terms by score:
+Sort terms numerically by score:
 .PP
 .RS
 .nf
@@ -442,19 +667,19 @@ Find documents similar to an indexed file:
 .PP
 .RS
 .nf
-tfidf query similar src/main.rs --top 10
+tfidf query --index docs.index similar src/main.rs --top 10
 .fi
 .RE
 .PP
-Open similar files through a pipeline:
+Pass similar document paths to another command:
 .PP
 .RS
 .nf
-tfidf query similar src/main.rs | cut -f1 | xargs ${PAGER:-less}
+tfidf query similar src/main.rs | cut -f1 | xargs ${EDITOR:-vi}
 .fi
 .RE
 .PP
-Search with a quoted query string:
+Search using a quoted query:
 .PP
 .RS
 .nf
@@ -462,7 +687,7 @@ tfidf query search "error handling rust" --top 20
 .fi
 .RE
 .PP
-Search with query text from standard input:
+Read a search query from standard input:
 .PP
 .RS
 .nf
@@ -470,11 +695,11 @@ echo "memory management" | tfidf query search --top 10
 .fi
 .RE
 .PP
-Use an environment-selected index:
+Select an index with the environment:
 .PP
 .RS
 .nf
-export TFIDF_INDEX=$PWD/docs.index
+export TFIDF_INDEX="$PWD/docs.index"
 tfidf save src/ notes/
 tfidf query terms
 .fi
@@ -485,63 +710,34 @@ Use a separate application namespace:
 .RS
 .nf
 export TFIDF_APPNAME=project-docs
-mkdir -p ~/.config/project-docs
-printf '%s\\n' the and of > ~/.config/project-docs/stopwords.txt
-tfidf save ~/work/docs
+mkdir -p "$HOME/.config/project-docs"
+printf '%s\\n' the and of > "$HOME/.config/project-docs/stopwords.txt"
+tfidf save "$HOME/work/docs"
 .fi
 .RE
-.SH FILES
-.TP
-.BR $TFIDF_DATA_DIR/tfidf.index
-Default index path when
-.B TFIDF_DATA_DIR
-is set.
-.TP
-.BR $XDG_DATA_HOME/$TFIDF_APPNAME/tfidf.index
-Default index path when
-.B XDG_DATA_HOME
-is set and
-.B TFIDF_DATA_DIR
-is unset.
-.TP
-.BR $HOME/.local/share/$TFIDF_APPNAME/tfidf.index
-Fallback default index path.
-.TP
-.BR $XDG_CONFIG_HOME/$TFIDF_APPNAME/stopwords.txt
-Primary stopword file.
-.TP
-.BR $HOME/.config/$TFIDF_APPNAME/stopwords.txt
-Fallback stopword file.
-.SH EXIT STATUS
-.TP
-.B 0
-Success.
-.TP
-.B 1
-Usage error, missing input paths, missing index, empty search query, unknown
-command, or another fatal error.
-.PP
-When stdout is closed by a downstream command in a pipeline,
-.B tfidf
-exits successfully without printing a broken-pipe error.
+
 .SH NOTES
-The index is serialized with
+Document paths are stored using their discovered string representation. They
+are not canonicalized. Relative paths generally remain relative, and
+.B query similar
+requires an exact string match.
+.PP
+The index is serialized using
 .BR bincode .
-The on-disk format is an implementation detail and should not be treated as a
-stable interchange format.
+Its on-disk representation is an implementation detail and is not a stable
+interchange format.
 .PP
-Index creation replaces the target index file. Incremental update operations are
-not currently exposed.
+Saving replaces the complete index. Incremental updates, index merging, and
+document removal are not exposed.
 .PP
-The
-.B search
-command uses the first non-option query argument as the query string. Quote
-multi-word queries so they are passed as one shell argument, or pipe the query on
-standard input.
+Filesystem traversal order, parallel file processing, and hash-map iteration
+order are not specified. Do not rely on stable ordering between independently
+built indexes, especially where scores are tied.
+
 .SH SEE ALSO
-.BR find (1),
-.BR cut (1),
-.BR sort (1),
 .BR awk (1),
-.BR xargs (1),
-.BR head (1)
+.BR cut (1),
+.BR find (1),
+.BR head (1),
+.BR sort (1),
+.BR xargs (1)
